@@ -64,21 +64,39 @@ def ndcg_at_k(scores, labels, k: int) -> float:
     return dcg / idcg
 
 
-def bootstrap_ci(values, n_iterations: int = 1000, seed: int | None = None) -> tuple[float, float, float]:
+def bootstrap_ci(
+    values, n_iterations: int = 1000, seed: int | None = None, max_chunk_cells: int = 200_000_000
+) -> tuple[float, float, float]:
     """Resample-with-replacement over `values` (one row per impression already
     computed once); returns (point_estimate, ci_lo, ci_hi) at the 95% level.
     Undefined (raises) for an empty slice -- callers with a legitimately empty
     slice (e.g. EB-NeRD's 0 cold-start users) should check for that themselves
-    rather than get a silently degenerate CI back."""
+    rather than get a silently degenerate CI back.
+
+    Processes iterations in chunks bounded by `max_chunk_cells` (resample-index
+    array cells, int32) rather than allocating one `(n_iterations, len(values))`
+    array up front -- at ebnerd_large's test-split scale (~12.5M impressions),
+    the naive single-shot array would be ~1000 * 12.5M * 8 bytes =~ 100GB.
+    Chunking keeps peak memory bounded regardless of dataset size; for every
+    dataset this project used before ebnerd_large, n_iterations * len(values)
+    is already under max_chunk_cells, so this is a single chunk exactly like
+    the original one-shot implementation (no behavior change)."""
     values = np.asarray(values, dtype=np.float64)
-    if len(values) == 0:
+    n = len(values)
+    if n == 0:
         raise ValueError("bootstrap_ci is undefined for an empty slice")
     point = float(values.mean())
-    if len(values) == 1:
+    if n == 1:
         return point, point, point
     rng = np.random.default_rng(seed)
-    resample_idx = rng.integers(0, len(values), size=(n_iterations, len(values)))
-    resample_means = values[resample_idx].mean(axis=1)
+    iters_per_chunk = max(1, max_chunk_cells // n)
+    resample_means = np.empty(n_iterations, dtype=np.float64)
+    start = 0
+    while start < n_iterations:
+        end = min(start + iters_per_chunk, n_iterations)
+        resample_idx = rng.integers(0, n, size=(end - start, n), dtype=np.int32)
+        resample_means[start:end] = values[resample_idx].mean(axis=1)
+        start = end
     lo, hi = np.percentile(resample_means, [2.5, 97.5])
     return point, float(lo), float(hi)
 

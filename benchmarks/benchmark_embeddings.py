@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from cs4406m26_assignment1c1.embeddings import _normalize_rows, mean_pool
+from cs4406m26_assignment1c1.embeddings import normalize_rows, mean_pool
 
 ROOT = Path(__file__).resolve().parent.parent
 RECENT_N_CLICKS = 20
@@ -48,8 +48,8 @@ def benchmark(dataset: str) -> None:
             query_vectors.append(vector)
     query_matrix = np.stack(query_vectors)
 
-    corpus_unit = _normalize_rows(corpus_matrix.astype(np.float32))
-    query_unit = _normalize_rows(query_matrix.astype(np.float32))
+    corpus_unit = normalize_rows(corpus_matrix.astype(np.float32))
+    query_unit = normalize_rows(query_matrix.astype(np.float32))
     n_docs = corpus_unit.shape[0]
 
     matmul_s = 0.0

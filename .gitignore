@@ -12,9 +12,15 @@ wheels/
 # Datasets
 ebnerd_demo/
 ebnerd_small/
+ebnerd_large/
+ebnerd_testset/
 MINDsmall_dev/
 MINDsmall_train/
+MINDlarge_dev/
+MINDlarge_train/
+MINDlarge_test/
 data/
+__MACOSX/
 
 # Codabench submissions (Q5) -- generated, and *.zip is excluded by Q8's git policy
 submissions/

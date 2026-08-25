@@ -222,11 +222,18 @@ uv run python build_pipeline.py
 ```
 
 Executes [`src/build_pipeline.ipynb`](src/build_pipeline.ipynb) end-to-end: cleans and
-parses all three raw dataset tracks into the unified `articles`/`behaviors`/`history`
+parses raw dataset tracks into the unified `articles`/`behaviors`/`history`
 schema described in `SPEC.md`, assigns a time-based `train`/`val`/`test` split, runs the
 Q9 no-future-click-leakage checks, and writes the result to
-`data/processed/{ebnerd,ebnerd_small,mind}/` (gitignored). Every step's assertions
-must pass or the rebuild aborts — see `SPEC.md` for the full design.
+`data/processed/{ebnerd,ebnerd_small,mind,ebnerd_large,mind_large}/` (gitignored).
+Every step's assertions must pass or the rebuild aborts — see `SPEC.md` for the full design.
+
+The notebook's `BUILD_LARGE_ONLY` flag (top setup cell) controls scope: `True`
+(re)builds/writes only `ebnerd_large`/`mind_large` and leaves
+`ebnerd`/`ebnerd_small`/`mind` completely untouched (not read, not written);
+`False` rebuilds all five tracks. See `SPEC.md` Q1 #5 for why (memory
+management at `ebnerd_large`'s ~24.6M-row scale) and the same flag's use in
+Q2-Q5 below.
 
 ## Run BM25 lexical retrieval (Q2)
 
@@ -241,7 +248,8 @@ from-scratch BM25 index per dataset (postings-list inverted index, in
 no third-party BM25 library, see `SPEC.md` for why), retrieves top-K
 candidates per user from their pre-window click history, and writes
 `bm25_topk.parquet` + `bm25_metrics.json` (recall@{50,100,200} on val/test) to
-`data/processed/{ebnerd,ebnerd_small,mind}/`.
+`data/processed/{dataset}/`. Same `BUILD_LARGE_ONLY` flag/scope as Q1 (see
+above) — this and every notebook below (Q3-Q5) carry the identical flag.
 
 Verify the from-scratch-vs-`rank_bm25` performance claim in `SPEC.md` Q2 #1
 (the reason `bm25.py` is hand-built rather than a library call):
@@ -263,11 +271,11 @@ Article embeddings are computed on a GPU on Kaggle, not locally — see
 `SPEC.md` Q3 #1 for why. Steps:
 
 1. Rename local copies of `data/processed/{dataset}/articles.parquet` to
-   `{dataset}_articles.parquet` for whichever of `ebnerd`/`ebnerd_small`/`mind`
-   you need embeddings for (all three, or just the one that changed — the
-   notebook auto-discovers whichever subset is attached), then upload them
-   together as one private Kaggle Dataset (Kaggle → New Notebook →
-   **+ Add Data → Upload → New Dataset**).
+   `{dataset}_articles.parquet` for whichever of
+   `ebnerd`/`ebnerd_small`/`ebnerd_large`/`mind`/`mind_large` you need
+   embeddings for (the notebook auto-discovers whichever subset is
+   attached), then upload them together as one private Kaggle Dataset
+   (Kaggle → New Notebook → **+ Add Data → Upload → New Dataset**).
 2. Import [`src/compute_embeddings_kaggle.ipynb`](src/compute_embeddings_kaggle.ipynb)
    into a Kaggle Notebook (File → Import Notebook).
 3. In the notebook's Settings (right sidebar): **Accelerator → GPU T4 x2**
@@ -298,7 +306,8 @@ top-K candidates via batched brute-force cosine similarity (in
 no FAISS/ANN library, see `SPEC.md` for why brute-force is fast enough at
 this scale), and writes `embedding_topk.parquet` + `embedding_metrics.json`
 (recall@{50,100,200} on val/test, plus a lexical-vs-semantic comparison
-against Q2's BM25 results) to `data/processed/{ebnerd,ebnerd_small,mind}/`.
+against Q2's BM25 results) to `data/processed/{dataset}/`. Same
+`BUILD_LARGE_ONLY` flag/scope as Q1.
 
 Verify the brute-force-vs-FAISS performance claim in `SPEC.md` Q3 #2 (why no
 ANN library is used):
@@ -326,7 +335,8 @@ end-to-end: re-ranks each impression's own `article_ids_inview` with a
 full-catalog recall@K), computes AUC/MRR/nDCG@{5,10}, intra-list diversity,
 novelty, and coverage, slices by cold-start-vs-warm and head-vs-tail, and
 bootstraps a 95% CI per `(dataset, method, split, slice, metric)`. Writes
-`eval_metrics.json` to `data/processed/{ebnerd,ebnerd_small,mind}/`.
+`eval_metrics.json` to `data/processed/{dataset}/`. Same `BUILD_LARGE_ONLY`
+flag/scope as Q1.
 
 Verify the bootstrap-CI timing claim in `SPEC.md` Q4 #5 (computationally
 trivial even at MIND's ~70K-impression test-split scale):
@@ -345,38 +355,69 @@ uv run python generate_predictions.py
 ```
 
 Requires the Q1 feature store and Q3's `article_embeddings.parquet` for
-**all three** dataset tracks. Executes
+every dataset in scope. Executes
 [`src/generate_predictions.ipynb`](src/generate_predictions.ipynb)
 end-to-end: re-ranks each dataset's `test` split with the same
 `score_inview` adapters as Q4, and writes
-`submissions/{ebnerd,ebnerd_small,mind}/{dataset}_{embedding,bm25}_test_predictions.zip`,
-each containing a single `prediction.txt` (MIND) or `predictions.txt`
-(EB-NeRD/EB-NeRD small) — one line per impression, `{impression_id}
-[{rank_1},...,{rank_n}]`, row order matching the original file.
+`submissions/{dataset}/{dataset}_{embedding,bm25}_test_predictions.zip`,
+each containing a single `prediction.txt` (MIND/`mind_large`) or
+`predictions.txt` (EB-NeRD/`ebnerd_small`/`ebnerd_large`) — one line per
+impression, `{impression_id} [{rank_1},...,{rank_n}]`, row order matching
+the original file. Same `BUILD_LARGE_ONLY` flag/scope as Q1.
 
-> **Known-bad assumption, not yet fixed**: a real MIND submission (the BM25
-> zip) already failed on Codabench with a candidate-set mismatch — MIND's
-> competition almost certainly scores against `MINDlarge_test`, a separate
-> held-out file, not MINDsmall's provider `dev/` (which `test` here
-> currently is). See `SPEC.md` Q5 #3. EB-NeRD's zip carries the same
-> unverified-population risk and hasn't been tested against Codabench at
-> all yet. **Treat both zips as unverified until each competition's actual
-> expected test population is confirmed** — don't submit blind.
->
-> **`ebnerd_small`'s zip is not a Codabench submission at all** — generated
-> for local completeness only. The real EB-NeRD competition scores
-> `ebnerd_testset.zip`, a separate hidden bundle, not `ebnerd_small` (see
-> `SPEC.md` Q5 #3/#4). Do not upload it to Codabench.
+> **`ebnerd_small`/`ebnerd_large`/`mind_large`'s zips are not Codabench
+> submissions at all** — generated for local completeness only. Each real
+> competition scores a separate, real blind test population instead (see
+> below): MIND scores `MINDlarge_test`, not `mind_large` (built from
+> `MINDlarge_train`/`MINDlarge_dev`); EB-NeRD/RecSys 2024 scores
+> `ebnerd_testset.zip`, not `ebnerd_small`/`ebnerd_large` (see `SPEC.md` Q5
+> #3/#4/#6). Do not upload any of these three to Codabench.
 
-To submit once confirmed: register at
+### Generate the real MIND submission (`MINDlarge_test`)
+
+Requires `MINDlarge_test.zip` downloaded separately and extracted to
+`./MINDlarge_test/` (gitignored, not part of `data/raw`).
+
+```bash
+uv run python _run_nbconvert_selector_loop.py src/mind_large_test_submission.ipynb 10800
+```
+
+Executes [`src/mind_large_test_submission.ipynb`](src/mind_large_test_submission.ipynb)
+end-to-end (runs in two sittings — pauses for a manual Kaggle embeddings
+round for the 26,228 articles absent from `mind_large`'s existing catalog,
+see the notebook's own **PAUSE HERE** cell) and writes
+`submissions/mind_large_test/mind_large_test_{embedding,bm25}_predictions.zip`.
+The notebook's own test cells verify every numeric claim in `SPEC.md` §7
+as they run (schema parity, catalog-overlap counts, embedding-reuse
+byte-identity, round-trip prediction counts) — a clean top-to-bottom run
+*is* the verification.
+
+### Generate the real EB-NeRD submission (`ebnerd_testset`)
+
+Requires `ebnerd_testset.zip` downloaded separately and extracted to
+`./ebnerd_testset/` (gitignored, not part of `data/raw`).
+
+```bash
+uv run python _run_nbconvert_selector_loop.py src/ebnerd_testset_submission.ipynb 10800
+```
+
+Executes [`src/ebnerd_testset_submission.ipynb`](src/ebnerd_testset_submission.ipynb)
+end-to-end (no Kaggle step needed — reuses `ebnerd_large`'s article catalog
+and embeddings directly, see `SPEC.md` §8) and writes
+`submissions/ebnerd_testset/ebnerd_testset_{embedding,bm25}_predictions.zip`.
+As above, the notebook's own test cells verify every numeric claim in
+`SPEC.md` §8 (catalog identity, the `is_beyond_accuracy`
+13,536,710-total/13,336,710-scored/200,000-excluded split, round-trip
+prediction counts) as part of running it.
+
+To submit either: register at
 [codabench.org/competitions/13967](https://www.codabench.org/competitions/13967/)
 (MIND) or
 [codabench.org/competitions/2469](https://www.codabench.org/competitions/2469/)
 (EB-NeRD/RecSys 2024), go to **Participate → Submit / View Results**, and
-upload the `embedding` zip for that dataset (embeddings scored better than
-BM25 in Q4's comparison on every dataset track). MIND is limited to one
-submission per day. Screenshot the resulting leaderboard score for the Q6
-design note.
+upload the `embedding` zip (embeddings scored better than BM25 in Q4's
+comparison on every dataset track). MIND is limited to one submission per
+day. Screenshot the resulting leaderboard score for the Q6 design note.
 
 ## Dataset location
 

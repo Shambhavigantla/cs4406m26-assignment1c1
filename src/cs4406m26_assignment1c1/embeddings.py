@@ -18,7 +18,7 @@ def mean_pool(article_ids, embedding_lookup: dict[str, np.ndarray]) -> np.ndarra
     return np.mean(vectors, axis=0)
 
 
-def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
+def normalize_rows(matrix: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     return matrix / norms
@@ -41,8 +41,8 @@ def batched_top_k(
     by construction.
     """
     n_docs = corpus_matrix.shape[0]
-    corpus_unit = _normalize_rows(corpus_matrix.astype(np.float32))
-    query_unit = _normalize_rows(query_matrix.astype(np.float32))
+    corpus_unit = normalize_rows(corpus_matrix.astype(np.float32))
+    query_unit = normalize_rows(query_matrix.astype(np.float32))
 
     results: list[list[tuple[str, float]]] = []
     for start in range(0, len(query_unit), batch_size):
@@ -64,18 +64,26 @@ def batched_top_k(
 
 def cosine_similarity_subset(
     query_vector: np.ndarray | None,
-    corpus_matrix: np.ndarray,
+    corpus_unit: np.ndarray,
     doc_ids: np.ndarray,
+    id_to_idx: dict[str, int],
     subset_ids: list[str],
 ) -> dict[str, float]:
+    """`corpus_unit` must already be row-normalized (via `normalize_rows`) and
+    `id_to_idx` must map every `doc_ids[i] -> i` -- both precomputed *once* by
+    the caller and reused across calls. An earlier version rebuilt
+    `id_to_idx` (a dict over the whole corpus) and re-normalized the
+    corpus-subset on every call; at ebnerd_large's Q4/Q5 re-ranking scale
+    (12.5M+ calls against a 125,541-doc corpus), rebuilding a 125,541-entry
+    dict per call was the dominant cost of the whole scoring pass -- see
+    SPEC.md Q4 #9."""
     if query_vector is None:
         return {}
-    id_to_idx = {aid: i for i, aid in enumerate(doc_ids)}
     idxs = [id_to_idx[aid] for aid in subset_ids if aid in id_to_idx]
     if not idxs:
         return {}
 
-    sub_unit = _normalize_rows(corpus_matrix[idxs].astype(np.float32))
+    sub_unit = corpus_unit[idxs]
     q_norm = np.linalg.norm(query_vector)
     q_unit = (query_vector / q_norm if q_norm else query_vector).astype(np.float32)
     scores = sub_unit @ q_unit

@@ -546,30 +546,291 @@ and `generate_predictions` produced a correctly-formatted (but
 not-for-Codabench-submission, since `ebnerd_small` isn't a real competition
 track) `predictions.txt` zip (Q5). Updated `SPEC.md` and `README.md`
 throughout to describe three dataset tracks instead of two.
-added before this can actually be resolved, same open follow-up as MIND's.
 
-### "look bro, i have written some parts of the design_note on my own, write the rest pls :) keep the formal followed in the assignment. Don't use overly complex words, use simple ones and don't use em-dashes. Match the writing style already present in the design note so far" (interrupted, then "you were interrupted, continue pls")
+### "now Run Q1 to Q5 on ebnerd large and mindlarge and generate the submissions.zip"
 
-Completed `design_note.tex` (Q6), which previously had only the Introduction
-and a half-finished BM-25 Preliminaries subsection. Read the assignment PDF
-and `SPEC.md` first, then pulled real numbers straight from the already
-executed notebooks' saved cell outputs (`bm25_retrieval.ipynb`,
-`embedding_retrieval.ipynb`, `evaluation_harness.ipynb`) instead of
-re-deriving or guessing figures, since `data/processed/` itself is
-gitignored and not present in the working tree. Finished the BM-25 formulas
-(IDF, document length normalization, final score), added one subsection per
-Q1-Q5 pulling each one's "why" from `SPEC.md`, and a Discussion section with
-a real recall@200 table, the AUC reversal between candidate-generation and
-re-ranking framings, dataset differences, and a 10x scale-breakdown list.
-Q5's subsection reports the still-unresolved Codabench submission failures
-honestly (candidate-set/impression-ID mismatches, root-caused to the wrong
-test population) rather than presenting Q5 as complete.
+`ebnerd_large` (3.4GB) and `MINDlarge_train`/`MINDlarge_dev` were already
+present on disk (untracked). Investigated scale before touching code:
+`ebnerd_large` is 125,541 articles / ~24.6M behavior rows / ~790K users --
+about 50x `ebnerd_small`'s behavior-row count; `MINDlarge` is ~161K articles
+(pre-dedup) / ~2.6M behavior rows. Two real blockers found before writing
+anything: (1) `evaluation.py`'s `bootstrap_ci` builds one
+`(n_iterations, n_impressions)` resample-index array up front -- at
+`ebnerd_large`'s ~12.5M-impression test split that's a ~100GB allocation,
+guaranteed to crash. Fixed by chunking the resampling loop, bounded by a
+`max_chunk_cells` parameter, with existing small-dataset behavior unchanged
+(verified: point estimate identical, CI statistically consistent across
+chunk sizes). (2) Neither `MINDlarge_test` nor `ebnerd_testset.zip` (the
+real Codabench populations) are downloaded -- flagged the same
+wrong-population caveat that already burned the small-scale submissions,
+before generating anything, not after another failed upload. Extended
+`build_pipeline.ipynb` with `ebnerd_large`/`mind_large` as two more additive
+tracks (parametrized `build_mind_*` functions the same way `build_ebnerd_*`
+already were, since MIND's builders were still hardcoded to `"mind_"`).
+First real run was manually stopped by the user mid-execution (see below).
 
-The assignment caps the design note at 4 pages; the first full draft
-compiled to 6. Cut prose by roughly a third across every subsection,
-tightened margins and list spacing (no `enumitem`/`titlesec` available
-locally, so list spacing was tightened via a manual `\@listI` redefinition
-instead), and iterated by actually compiling with `latexmk` and checking the
-rendered page count and per-page character distribution each time, rather
-than guessing at length. Rendered each final page to a PNG for a visual
-proofread pass before finishing.
+### "stop the background process" (x2, over two separate runs)
+
+Both times, the named background task had already lost its own completion
+record, but the actual OS process (the notebook kernel) was still alive and
+consuming real CPU/memory. Verified this directly via `Get-Process`/
+`Get-CimInstance` before/after killing, rather than trusting the task
+tracker's "stopped" label at face value -- confirmed a live PID with
+non-trivial accumulated CPU time and multi-GB working set both times, then
+`Stop-Process -Force`'d it and re-checked that the PID was actually gone.
+
+### "do you think using dask / polars is going to be helpful?"
+
+Exploratory question, answered with a recommendation plus the main
+tradeoff rather than an exhaustive survey (per this session's style
+guidance): Polars over Dask, because the actual bottlenecks in
+`build_pipeline.ipynb` (single-threaded pandas TSV parsing for MINDlarge,
+and Python-object-per-list-element overhead in the `.apply()`/`.map()`
+prefix-namespacing transforms) are exactly what Polars' multi-threaded
+parser and native `list`/`str` expression API solve directly, whereas
+Dask's value (out-of-core chunking, multi-machine parallelism) doesn't
+apply here -- the data isn't clearly bigger than RAM going in, and Dask's
+list-column support is a worse fit for these specific transforms than
+Polars' expression API.
+
+### "do the polars rewrite, i give you the go ahead to proceed with it"
+
+`uv add polars`, then validated the rewrite against already-verified pandas
+output (`ebnerd_small`, `mind`) in standalone scratch scripts *before*
+touching the notebook or spending a long run on `ebnerd_large`/`mind_large`.
+EB-NeRD matched perfectly. MIND's validation surfaced a real, previously
+undetected bug in the *existing* pandas-based pipeline, not something the
+rewrite introduced: `pandas.read_csv`'s default CSV-quote handling was
+silently stripping literal `"` characters from ~62 article titles / ~628
+abstracts (MIND's TSVs aren't CSV-quoted at all). `polars.read_csv(...,
+quote_char=None)` preserves them; confirmed the fix has no effect on BM25
+(its tokenizer discards punctuation) and a negligible one on embeddings
+(<1% of articles, punctuation-only), so it didn't warrant rerunning
+already-computed `mind` results, just noting. Ported the validated logic
+into `build_pipeline.ipynb` (raw loading + `build_*` transforms in polars,
+still returning pandas via `.to_pandas()` so every downstream cell is
+unchanged) and reran. That run crashed with `ArrowNotImplementedError:
+Nested data conversions not implemented for chunked array outputs` reading
+back `ebnerd_large`'s freshly-written `history.parquet` -- root-caused by
+directly testing both writers on the exact failing file: `pandas.to_parquet`
+produced a file pyarrow itself couldn't fully read back at this row count
+(974,791 rows, nested `list<datetime>`/`list<float>` columns); writing the
+identical data via `polars.write_parquet` instead read back cleanly. Fixed
+`write_feature_store` to write through polars. The next full rerun then hit
+a second, different failure -- `DeadKernelError` (OOM, 16GB RAM on this
+machine) at write time, from holding every dataset's raw polars frames and
+built pandas tables simultaneously plus a transient `pl.from_pandas()` copy
+per write. Fixed by freeing memory as early as safe: `del` each raw polars
+frame right after its last consumer, and write-then-immediately-delete each
+dataset's tables one at a time instead of building all five before writing
+any. Also added a plain-text `build_progress.log`, timestamped and flushed
+after every major step, specifically so progress on a multi-minute run
+could be watched externally without relying on the notebook's own
+saved-once-at-the-end output.
+
+### "are you documenting these memory optimizations somewhere? If not then do it"
+
+Correction -- the polars rewrite, the pyarrow parquet-writer bug, and the
+memory-management restructuring had all been implemented and verified but
+not yet written up anywhere durable. Updated `SPEC.md` Q1 sections 4-6 with
+the `ebnerd_large`/`mind_large` feature-store paths, a full writeup of why
+polars replaced pandas for raw parsing/transforms (with the quote-stripping
+bug as a named example, not just "it's faster"), the parquet-writer bug and
+fix, and the free-as-you-go memory pattern -- and backfilled this file with
+every prompt from this stretch of work that hadn't been logged yet.
+
+### "give me an introduction paragraph to write in the design note"
+
+A request for design-note text, not an instruction to edit the file --
+answered directly in chat rather than inserted into `design_note.tex`
+(which was confirmed empty at the time: just the three bare
+`\section{...}` headers). Logged here per the instruction to log important
+prompts, but no code/doc change resulted from it directly.
+
+### "nono, dont do all the datasets at all, only do it for the large datasets, forget the small datasets for now, don't remove all existence of them from the repo, just during execution, don't execute them, also make sure you don't erase the results of the small and demo datasets from earlier runs"
+
+Correction -- a full 5-dataset rebuild was in flight (mid-OOM-debugging) when
+this landed; the user wanted the remaining iteration scoped down to just
+`ebnerd_large`/`mind_large`, both to go faster and to eliminate any further
+risk to the already-good `ebnerd`/`ebnerd_small`/`mind` outputs from Q1-Q4.
+Stopped the in-flight background run, verified via `Get-Process`/file
+listing that the three existing output directories were untouched, then
+added a `BUILD_LARGE_ONLY` flag threaded through `build_pipeline.ipynb`:
+`if not BUILD_LARGE_ONLY:` guards around every demo/small/mind-regular
+build+test cell, and the two write cells never call `write_feature_store()`
+for a skipped dataset -- only setting an unwritten path variable -- so
+those directories are provably never touched, not just skipped by
+convention. Relaunched with `BUILD_LARGE_ONLY=True`; both large tracks
+built and wrote successfully (verified via `build_progress.log` timestamps
+against the run's actual start time, confirming the three existing
+directories' mtimes predated this run).
+
+### "do you think even for BM25, we need kaggle GPUs?"
+
+Exploratory question, answered directly (2-3 sentences, no code change):
+BM25 is pure lexical/term-frequency scoring, CPU-only regardless of dataset
+size -- only Q3's embedding model needs a GPU.
+
+### "ok then proceed with everything upto Q5, just let me know when you want me to run the ipynb file in kaggle gpu, also keep updating the build_progress.log file so that i can see whats going on" / "do the polars rewrite for all notebooks"
+
+Scope-setting for the rest of the `ebnerd_large`/`mind_large` push: extend
+Q2-Q5 (`bm25_retrieval.ipynb`, `embedding_retrieval.ipynb`,
+`evaluation_harness.ipynb`, `generate_predictions.ipynb`) the same way Q1
+was extended, rewrite their pandas loading/filtering to polars throughout
+(explicit reminder, not just Q1), keep appending to `build_progress.log`
+across all of them, and tell the user explicitly when
+`compute_embeddings_kaggle.ipynb` needs a real Kaggle GPU run rather than
+running it myself. Read all five notebooks in full directly (an Explore
+subagent was tried first for this and explicitly rejected -- the user
+wants this done inline, not delegated) before rewriting: added the same
+`BUILD_LARGE_ONLY` flag and `log_progress` helper to each, switched every
+`pd.read_parquet`/pandas filter to polars (with column projection at read
+time -- e.g. BM25 never loads `article_ids_inview`, Q5 lazily
+`scan_parquet().filter(split=="test")`s behaviors so `ebnerd_large`'s ~12M
+train/val rows never materialize), and switched output writing from
+`pandas.to_parquet` to building `pl.DataFrame`s directly (no pandas
+round-trip at all for the new top-K/prediction outputs, sidestepping the
+nested-array bug class entirely rather than needing Q1's chunked-writer
+workaround). Also caught and fixed two tests that would have silently gone
+vacuous under `BUILD_LARGE_ONLY` (`bm25_retrieval`'s null-abstract check
+was hardcoded to `"mind"`; `evaluation_harness`'s anti-gaming schema check
+was reading `feature_store`'s column-projected in-memory copy instead of
+the actual on-disk schema) -- generalized the first, switched the second to
+`pl.read_parquet_schema()` against the real file.
+
+### "after the writing finishes, stop for today. Don't continue anymore" / "ok continue doing the rest of the work"
+
+Session-boundary instructions bracketing Q2's (BM25) actual execution,
+which took several relaunches to get right — worth logging together since
+they mark a real multi-hour, multi-failure debugging arc, not just a
+one-line fix. The write step (`write_bm25_outputs`) OOM'd twice more even
+after the polars rewrite: once building the whole 821,111-row
+`pl.DataFrame` in one shot (fixed with a chunked writer, same pattern as
+Q1), then again merging just 17 chunk files via
+`polars.scan_parquet(...).sink_parquet(...)` (this polars version's
+`sink_parquet` turned out not to truly stream — collects the full result
+into memory first) — fixed by merging via `pyarrow.parquet.ParquetWriter`
+directly instead, verified on synthetic data at the same scale before
+trusting it on the real rerun. Stopped cleanly once Q2 finished and
+verified; resumed by launching Q3 (`embedding_retrieval.ipynb`), which had
+the identical chunked-write + pyarrow-merge fix already applied
+preemptively (same write shape, same risk).
+
+### "should this happen? this is just inference right?" / "why are new embeddings necessary? existing embeddings can be used for inference right?" / "if we use test set data to train embeddings, would that skew results?"
+
+Three connected pushback moments, each catching something real. First: Q5's
+run was taking hours for what's pure inference (no training happens
+anywhere in this pipeline) -- this pressure-tested whether the slowness was
+inherent or a bug, and it was a bug (`cosine_similarity_subset`'s hidden
+`O(n_docs))`-per-call cost, see the entry below). Second, on the newly
+supplied `MINDlarge_test.zip`: correctly pushed back on "just re-encode
+everything" as wasteful -- the right scope is encoding only the ~26,228
+articles genuinely absent from `mind_large`'s existing catalog and merging
+by `article_id`, not re-encoding all 120,961. Third, a real methodology
+question: does encoding test-set articles' *text* count as training on the
+test set? Answered directly -- no, because the embedding model is frozen/
+pretrained (no fine-tuning happens on any of our data), and per-article
+encoding is a deterministic, label-free transform with no cross-document
+statistics; the actual leakage boundary (never letting a test impression's
+own click label influence its own score) was never crossed. Building the
+real `MINDlarge_test` submission itself is still pending -- this was
+scoping/methodology only.
+
+### "you have made plenty of optimizations throughout these runs... write all these optimisations down properly in SPEC.md"
+
+Correction -- Q2 #10/Q3 #10/Q4 #9/Q5 #6 already had older writeups but were
+missing several fixes made after they were last written (or, for Q3/Q4,
+described the *pre-fix* code as if it were final). Rewrote all four
+sections with the complete, current set: Q2/Q3's chunked-write +
+`pyarrow.parquet.ParquetWriter`-merge fix (was previously described as
+"sidesteps the bug entirely," which turned out false -- it hit the exact
+same class of OOM despite never touching `pandas`); the `gc.collect()`
+removal (a forced full-heap scan costing minutes per call given these
+notebooks' large persistent state, not the near-zero cost it normally has);
+Q3's `batched_top_k` results-list accumulation `MemoryError` and its
+`QUERY_CHUNK_SIZE`/reduced-`BATCH_SIZE` fix; the `WindowsSelectorEventLoopPolicy`
+wrapper script fixing intermittent ZMQ/socket kernel crashes
+(`WinError 10055`) on this machine's long-running kernels; Q4's
+dict-per-impression-row to preallocated-numpy-array fix in
+`evaluate_ranking`; and the big one -- `cosine_similarity_subset` rebuilding
+a 125,541-entry `id_to_idx` dict *and* re-normalizing the corpus subset on
+every one of 12.5M+ calls, fixed by precomputing both once per dataset
+(mirroring the `bm25_fn` adapter's existing pattern) and changing the
+function's signature accordingly -- measured end-to-end via Q5: an unfixed
+run hadn't finished its first of eight scoring passes after 2h21m; the
+fixed version finished all four of Q5's passes (~12.9M impressions) in ~99
+minutes. Also fixed two stale "SPEC.md Q4 #6" code-comment references left
+over from before the section was renumbered to #9.
+
+### "is it consistent with the unified dataset format we have designed" / "why did you reduce the schema? wouldn't that cause problems?"
+
+Correction, in two steps. Built `mind_large_test_submission.ipynb` (the real
+`MINDlarge_test` submission notebook) with a stripped-down schema
+(`article_id`/`title`/`abstract`; `impression_id`/`user_id`/
+`article_ids_inview`) on the reasoning that no other notebook ever reads
+this directory. First question caught that this wasn't actually verified --
+checked directly against `mind_large`'s real schema and found three
+genuinely-avoidable gaps (`dataset`, `category`/`subcategory`,
+`impression_time` -- all present in the raw files for free) mixed in with
+gaps that are either impossible (`article_ids_clicked` -- no ground truth in
+a blind test) or already-established MIND-format nulls (`body`,
+`session_id`, etc.). Second question pushed on the "why" directly rather
+than accepting a menu of options -- correct call: optimizing for this one
+notebook's narrow needs instead of a consistent `data/processed/` contract
+was the wrong tradeoff given the fix was nearly free. Added the three
+genuine gaps back, matching `mind_large`'s schema exactly except for
+`article_ids_clicked` (kept deliberately absent, not null-filled -- a
+structural fact about this being a real blind test, not a MIND-format
+limitation like the null columns it would otherwise sit next to). Re-ran
+and verified: schema now matches field-for-field, all parsing tests still
+pass, 2,370,727 impressions / 702,005 users / 3,993 cold-start users / 0
+history-consistency violations on the real file.
+
+### "just like we had to generate the embeddings again for mind, do we need to do the same for ebnerd_testset.zip as well, if so give me the process so i can run on kaggle"
+
+Investigation, not an assumed "yes." Extracted `ebnerd_testset.zip` and
+directly compared its article catalog against `ebnerd_large`'s existing,
+already-embedded one via exact Python set equality
+(`test_raw_ids == existing_raw_ids`) rather than assuming symmetry with
+MIND's situation. Result: **no** Kaggle round needed -- the two catalogs
+are exactly identical, 125,541/125,541, zero missing and zero extra. This
+is a real, structural difference from MIND (see #6/#7): EB-NeRD shares one
+static article pool across every split by design, while MIND's splits are
+time-windowed slices of a continuously-published pool, so MIND's real test
+introduced genuinely new articles (26,228 of them) that EB-NeRD's doesn't.
+Built `ebnerd_testset_submission.ipynb` to reuse `ebnerd_large`'s existing
+`articles.parquet`/`article_embeddings.parquet` directly (no re-parsing, no
+Kaggle step), with a hard `test_catalogs_identical` test that fails loudly
+if a future zip revision ever breaks this assumption.
+
+### "if there is an id overlap with ebnerd large, doesn't that mean that ebnerd large's train set and ebnerd_testset have the same articles? If it is so, then the results will be skewed right because we are training the data on the testset"
+
+Leakage concern, answered directly rather than with reassurance alone. Key
+distinction: EB-NeRD's *article catalog* (content) and its *behavior/click
+data* are separate things split independently -- the 125,541-article
+overlap found above is catalog identity, not behavior-data identity;
+`ebnerd_testset` has no click labels at all (`article_ids_clicked` is
+absent, same as MIND's real test, see #7). Nothing in this pipeline trains
+a supervised model on clicks anywhere, for any dataset -- BM25's corpus
+statistics and the embedding model are both built from article *text*
+only, computed once, independent of which split's candidate list happens
+to reference a given article ID. So catalog overlap, however large, cannot
+leak click information because click information is never part of what's
+being shared.
+
+### "there was an overlap for mind as well, is the separation well defined for mind too like in ebnerd?"
+
+Direct comparison using numbers already in hand from #7 and the entry
+above: EB-NeRD's overlap is total identity (125,541/125,541, verified via
+exact set equality); MIND's is partial (94,733/120,961 overlap, 26,228
+test-only articles absent from train/dev, verified the same way plus
+`isdisjoint`/`issubset` test assertions and a byte-identical-reuse check on
+the merged embeddings). Explained why the shapes differ rather than
+treating the difference as a bug: EB-NeRD shares one static pool by design;
+MIND's splits are time-windowed samples of a continuously-published pool,
+so partial overlap (old articles still candidates in a later window, new
+articles published after the earlier window closed) is the expected,
+realistic pattern. Also noted the leakage argument doesn't depend on
+overlap percentage either way -- it depends on whether click labels cross
+into anything upstream of scoring, which they never do for either dataset,
+so both are equally sound despite the different overlap numbers.

@@ -117,11 +117,30 @@ data/processed/ebnerd_small/articles.parquet
 data/processed/ebnerd_small/behaviors.parquet
 data/processed/ebnerd_small/history.parquet
 data/processed/ebnerd_small/manifest.json
+data/processed/ebnerd_large/articles.parquet
+data/processed/ebnerd_large/behaviors.parquet
+data/processed/ebnerd_large/history.parquet
+data/processed/ebnerd_large/manifest.json
 data/processed/mind/articles.parquet
 data/processed/mind/behaviors.parquet
 data/processed/mind/history.parquet
 data/processed/mind/manifest.json
+data/processed/mind_large/articles.parquet
+data/processed/mind_large/behaviors.parquet
+data/processed/mind_large/history.parquet
+data/processed/mind_large/manifest.json
 ```
+
+`ebnerd_large` and `mind_large` are two more additive, independent dataset
+tracks (own namespace prefix, own `data/processed/{name}/` directory) —
+same "shared code, different `prefix` argument" pattern as `ebnerd_small`,
+built by the same `build_ebnerd_*`/`build_mind_*` functions. At real scale:
+`ebnerd_large` is 125,541 articles / ~24.6M behavior rows / ~975K users;
+`mind_large` (from `MINDlarge_train`+`MINDlarge_dev`, not `MINDsmall`) is
+~104K articles / ~2.6M behavior rows / ~750K users. Both share their
+respective demo/small counterpart's exact provider date range, so the same
+`EBNERD_TRAIN_END`/`EBNERD_TEST_START`/`MIND_TRAIN_END`/`MIND_TEST_START`
+cutoffs apply — verified directly on the raw files, not assumed.
 
 `data/` is added to `.gitignore` (matches Q8's "no large files / `data/`" policy).
 Raw inputs stay wherever they already are on disk (`ebnerd_demo/`, `ebnerd_small/`,
@@ -155,8 +174,7 @@ with this cell sequence (each numbered item = title/feature/test cell triple):
    reconstructed per-impression from later data. Verified on real data: 0/91,935
    users violate this. This check is already required to build `mind_history` (#2
    step 6) and is additionally asserted as an explicit test here.
-5. Write feature store — serialize all six parquet files + two manifests to
-   `data/processed/`
+5. Write feature store — serialize all parquet files + manifests to `data/processed/`
 6. One-command rebuild entrypoint
 
 **One-command rebuild**: a thin `build_pipeline.py` at the repo root (as literally
@@ -167,12 +185,178 @@ notebook top-to-bottom re-runs every feature+test cell, so a failed assertion in
 test cell aborts the rebuild — that's the pipeline's correctness gate. README gets a
 one-line "Rebuild the feature store" section pointing at this command.
 
+Progress during a rebuild is additionally mirrored to a plain-text
+`build_progress.log` at the repo root (gitignored, truncated at the start of
+each run) — a timestamped line after every dataset/table/write step,
+independent of the notebook's own saved output (`nbconvert --execute
+--inplace` only writes `build_pipeline.ipynb` back to disk once, at the very
+end of a successful run, so it can't itself be tailed mid-run). Lets a
+rebuild's progress be watched externally (e.g. `tail -f build_progress.log`)
+without touching Jupyter, and lets a specific dataset's persistence be
+confirmed independently by checking whether its `manifest.json` exists yet.
+
+### `polars`, not `pandas`, for raw parsing and the prefix-namespacing transforms
+
+`ebnerd_large` (~24.6M behavior rows, 125,541 articles, ~975K users) and
+`mind_large` (~2.6M behavior rows, ~104K articles, ~750K users) are two more
+orders of magnitude larger than `ebnerd`/`ebnerd_small`/`mind`. At that
+scale, the original `pandas.read_csv` (MIND's TSVs) plus
+`.apply()`/`.map()`-based prefix-namespacing (adding the dataset prefix to
+every `article_id` inside every list column) became the actual bottleneck —
+Python-object overhead per string/list element, not I/O. `polars` replaces
+both: `pl.read_csv(..., separator="\t")` for MIND's TSVs (multi-threaded,
+not single-threaded like pandas' C parser) and its expression API
+(`list.eval`, `pl.element()`) for the prefix-namespacing, which runs as a
+vectorized, multi-threaded Rust operation instead of a Python loop per list
+element. Every `build_*` function still returns a plain `pandas.DataFrame`
+(`.to_pandas()` at the end), so the temporal split, leakage checks, and
+tests downstream are unchanged and still operate on pandas — only raw
+loading and the unify-to-schema transform itself changed.
+
+MIND's `impressions` field (`news_id-label` tokens packed into one
+space-separated string) is parsed via an explode → transform → group-by →
+join-back pattern instead of a per-row Python function
+(`split_impressions` + `.map()`): explode each impression's tokens into
+their own rows, extract `id`/`label` per token via `str.slice` from each
+end (`"N55689-1"` → id `"N55689"`, label `"1"` — matches the original
+`rsplit("-", 1)` semantics exactly, robust to a hypothetical literal `-` in
+an id), filter to clicked tokens, then re-aggregate both candidate and
+clicked lists back per impression via `group_by(row_id).agg(...)` and join
+back onto the original row order (`.sort("row_id")` after the join — polars
+left-joins aren't documented to preserve row order, and Q5's submission
+format depends on it). Every step is a vectorized polars operation, not a
+Python loop per row per token.
+
+**Correctness fix found along the way, not just a speedup**: `polars.read_csv(...,
+quote_char=None)` is used for MIND's TSVs instead of pandas' default
+CSV-quote handling. `news.tsv` is a raw TSV with no CSV-style escaping
+convention, but pandas' C parser applies `quotechar='"'` semantics
+regardless, which silently strips literal `"` characters from ~62 titles /
+~628 abstracts across MIND's catalog (verified directly against the
+already-built `mind`/`mind_large` catalogs — e.g. a title like `"It changed
+everything," Oklahoma woman...` loses both quote marks under the old
+pandas-based parsing). `quote_char=None` disables that interpretation, so
+these fields round-trip byte-for-byte. This has no effect on BM25 (its
+`\w+` tokenizer already discards punctuation) and a negligible one on
+embeddings (<1% of articles, punctuation-only difference, averaged over
+tens of thousands of impressions in any reported metric) — not something
+that required re-running already-computed Q2-Q5 results.
+
+### Parquet writer: `polars.write_parquet`, not `pandas.to_parquet`
+
+`write_feature_store` writes via `pl.from_pandas(df).write_parquet(path)`,
+not `df.to_parquet(path)`. This is a real bug fix, found directly: writing
+`ebnerd_large`'s `history.parquet` (974,791 rows, nested `list<datetime>`/
+`list<float>` columns) via pandas' own writer "succeeded" with no error at
+write time, but the resulting file then failed on read-back with
+`pyarrow.ArrowNotImplementedError: Nested data conversions not implemented
+for chunked array outputs` — a pyarrow limitation combining chunked nested
+list arrays that only surfaces at this row count (`ebnerd`/`ebnerd_small`'s
+much smaller history tables never hit it; `ebnerd_large`'s own
+`behaviors.parquet`, with different nested column types, also didn't hit
+it). Verified directly: the identical DataFrame written via
+`pl.from_pandas(...).write_parquet(...)` instead reads back via
+`pd.read_parquet` with no error, byte-identical data.
+
+### Memory management at `ebnerd_large`/`mind_large` scale
+
+Four attempts at running this pipeline against all five dataset tracks
+OOM-killed the kernel (16GB RAM on the reference machine), each time
+narrowing the actual cause:
+
+1. **First crash**: by write time, every dataset's raw `polars` frames and
+   built `pandas` tables were simultaneously resident, plus a transient
+   `polars` copy during each write's `pl.from_pandas()` conversion. Fixed
+   by freeing memory as early as it's safe to: each raw `polars` frame
+   (`{dataset}_articles_raw`, `{dataset}_behaviors_raw`,
+   `{dataset}_history_raw`) is `del`eted (+ `gc.collect()`) immediately
+   after its last consumer runs (most are only needed by their own
+   immediately-following schema test, for a `len(raw)` comparison; MIND's
+   `_behaviors_raw` frames are the exception, needed through both
+   `build_mind_history` and the Q9 leakage-check cell, so freed at the end
+   of that cell instead); and `write_feature_store` is called and its
+   result immediately deleted **one dataset at a time** (write `ebnerd` →
+   delete its tables → write `ebnerd_small` → delete → ...) instead of
+   building all five datasets' tables in memory and writing them at the
+   end.
+2. **Second crash, same root cause at a smaller scope**: even with the
+   fixes above, writing `ebnerd_large` (the single largest dataset) still
+   crashed, because `mind`/`mind_large`'s built tables were *also* resident
+   at that point — MIND's build cells run unconditionally before any
+   writing starts in the notebook's cell order, regardless of write order.
+   Freeing-as-you-write only bounds peak memory to "all five datasets that
+   have been built so far," which by `ebnerd_large`'s write time is still
+   all five.
+3. **Third crash, isolated down to a single dataset**: restructured the
+   notebook into two fully separate families, processed one after the
+   other — EB-NeRD (build → temporal split → leakage-check → write → free,
+   for `ebnerd`/`ebnerd_small`/`ebnerd_large` together) completely before
+   MIND's build cells even run, then MIND (`mind`/`mind_large`) the same
+   way. The temporal-split and leakage-check cells, previously one shared
+   cell each across all five datasets, are now two cells each (EB-NeRD-only,
+   MIND-only); `write_feature_store` and `assign_split` are defined once
+   (in EB-NeRD's cells) and reused as-is in MIND's. This capped peak memory
+   to one *family's* worth of data at a time — but writing `ebnerd_large`
+   *alone* (no MIND data resident at all) still crashed, isolating the true
+   cause to `ebnerd_large`'s own `behaviors` table (~24.6M rows): holding
+   its existing `pandas` representation *and* building a whole new `polars`
+   one via `pl.from_pandas()` simultaneously exceeds 16GB by itself,
+   independent of anything else in memory.
+4. **Fix**: `write_parquet_chunked` replaces the single
+   `pl.from_pandas(df).write_parquet(path)` call for tables above a row
+   threshold — convert and write each row-chunk to its own temp parquet
+   file (bounding the transient pandas+polars overlap to one chunk's size,
+   not the whole table), then merge the chunk files into the final path via
+   `polars.scan_parquet(...).sink_parquet(...)`, polars' streaming engine,
+   which merges without materializing every chunk in memory at once.
+   Verified directly on synthetic data with the same nested
+   `list<str>`/`list<datetime>` column shapes that a chunk-merged file
+   still reads back via `pd.read_parquet` with no error — doesn't
+   reintroduce the earlier `ArrowNotImplementedError` chunked-array bug
+   (#2 above), since each chunk file is itself a single, internally-
+   consistent `polars` write (the exact pattern already proven safe there),
+   not multiple row groups appended incrementally into one file.
+5. **Fifth crash, at the initial 2,000,000-row chunk size**: still failed at
+   the same write step. Diagnosed as Windows/CPython memory fragmentation
+   from the churn of building many nested-list `pandas` objects rather than
+   raw insufficiency (~12GB nominally free at the time of a ~2.6GB
+   allocation failure). Fixed by reducing `chunk_rows` to 300,000 and adding
+   a `log_progress` line per chunk written, so a recurrence would identify
+   the exact failing chunk rather than just "OOM somewhere in this table."
+
+**`BUILD_LARGE_ONLY` flag**: threaded through every EB-NeRD/MIND build+test/
+split/leakage/write cell as `if not BUILD_LARGE_ONLY: ...` guards. When
+`True` (used for the run that finally succeeded, below), `ebnerd`/
+`ebnerd_small`/`mind` are skipped entirely — not rebuilt with possibly-stale
+logic, not written to — while `ebnerd_large`/`mind_large` still build/write
+unconditionally; the two write cells set an unwritten path variable for a
+skipped dataset instead of ever calling `write_feature_store()` for it, so
+those three directories are provably untouched rather than merely
+skipped-by-convention. Verified directly on a real run: `ebnerd`/
+`ebnerd_small`/`mind`'s `articles.parquet`/`behaviors.parquet`/
+`history.parquet` mtimes all predated that run's own start timestamp.
+
+**Confirmed successful build** (300,000-row chunks, `BUILD_LARGE_ONLY=True`):
+`ebnerd_large` — 125,541 articles, 24,630,275 behaviors (10,384,901 train /
+1,678,989 val / 12,566,385 test), 974,791 history rows. `mind_large` —
+104,151 articles, 2,609,219 behaviors (1,801,231 train / 431,517 val /
+376,471 test), 750,434 history rows. Both `manifest.json`s present; the
+final round-trip test passed for all five dataset tracks.
+
+The final round-trip test (`test_feature_store_roundtrip`) reads expected
+row counts from each dataset's persisted `manifest.json` rather than the
+original in-memory DataFrames, since those are deliberately no longer
+resident by the time this test runs (from either family) — `manifest.json`
+was itself written from the same `len(articles)` etc. at write time, so
+it's an equally trustworthy source of truth without needing to keep the
+DataFrames alive.
+
 ## 6. Dependencies
 
-No new dependencies expected for Q1 — parsing (TSV via `pandas.read_csv`, JSON via
-stdlib `json`, Parquet via existing `pyarrow`) and writing the feature store all fit
-within `numpy`/`pandas`/`pyarrow`, already declared in `pyproject.toml`. Will confirm
-before running `uv add` if something unexpected comes up during implementation.
+`polars` (`uv add polars`) — added for raw parsing, the prefix-namespacing
+transforms, and parquet writing at `ebnerd_large`/`mind_large` scale (see
+above for why). Everything else fits within `numpy`/`pandas`/`pyarrow`,
+already declared in `pyproject.toml`.
 
 ## 7. Open questions / risks (flagged, not blocking)
 
@@ -340,6 +524,77 @@ one-command entrypoint (mirrors `build_pipeline.py`'s `nbconvert --execute
    `n_evaluated + n_excluded == n_total`; values in `[0,1]`.
 9. Persist `bm25_topk.parquet` + `bm25_metrics.json` + round-trip test.
 
+## 10. Scale: `ebnerd_large`/`mind_large`, and `BUILD_LARGE_ONLY`
+
+Same `polars`-not-`pandas` reasoning as Q1 (see Q1 #5), applied to this
+notebook (and Q3-Q5's, identically): `feature_store` loads via
+`pl.read_parquet(..., columns=[...])` with an explicit column projection per
+table, rather than loading every persisted column and filtering/dropping in
+memory afterward. This notebook never touches `article_ids_inview` at all
+(only Q4/Q5's re-ranking framing needs it), so `behaviors` is projected down
+to `user_id, article_ids_clicked, split`; `history` to
+`user_id, article_id_sequence`; `articles` to `article_id, title, abstract`
+— skipping columns not used here rather than loading `ebnerd_large`'s full
+24.6M-row behaviors table and its unused `article_ids_inview` lists.
+
+**Write-step OOM, two more iterations (not sidestepped by avoiding `pandas`
+as originally expected)**: `bm25_topk.parquet` is built straight from Python
+lists to `pl.DataFrame(...)`, never through `pandas` — but this still
+crashed at `ebnerd_large` scale (821,111 rows × two 200-element list
+columns, a ~2.6GB single allocation), because `polars` itself has to
+materialize one large contiguous buffer per column regardless of whether
+`pandas` is involved. Two fixes were needed, not one:
+
+1. `write_topk_parquet_chunked` (same pattern as Q1's `write_parquet_chunked`):
+   build and write each 50,000-row chunk to its own small parquet file
+   instead of one `pl.DataFrame` covering all 821,111 rows at once.
+2. The chunk *merge* step also crashed — `polars.scan_parquet(...).sink_parquet(...)`
+   OOM'd combining just 17 chunk files, because this polars version's
+   `sink_parquet` collects the full result into memory before writing
+   rather than truly streaming (unlike what its name/Q1's original usage
+   assumed). Left behind a truncated, unreadable parquet file on crash.
+   Fixed by merging via `pyarrow.parquet.ParquetWriter` directly instead:
+   read each chunk file as an Arrow table and `writer.write_table(table)`
+   to append it as its own row group — genuinely bounded to one chunk's
+   memory footprint regardless of the final file's total size, verified
+   directly on synthetic data at the same 850,000-row/200-element-list
+   scale before trusting it on the real (multi-hour) rerun.
+
+Confirmed successful run: `ebnerd_large` — 821,111 users retrieved, 0
+cold-start; recall@200 = 0.0053 (val) / 0.0063 (test). `mind_large` —
+415,122 retrieved, 10,423 cold-start (val) / 11,270 (test); recall@200 =
+0.0297 (val) / 0.0132 (test). Both `bm25_topk.parquet`/`bm25_metrics.json`
+round-trip correctly.
+
+**A further, non-obvious slowdown found while debugging Q3's copy of this
+same write step**: the chunked writer's `gc.collect()` calls (added
+defensively after each chunk write/merge, following Q1's `write_parquet_chunked`
+convention) turned out to cost minutes *per call*, not the near-zero cost
+`gc.collect()` normally has — because these notebooks keep a large amount
+of state alive throughout (BM25 indexes, the full `user_topk` dict, corpus
+matrices), and a forced `gc.collect()` scans the *entire* live object graph
+looking for reference cycles, not just the object just `del`eted. Since
+`chunk_df`/`table` are plain, non-cyclic objects, plain `del` already frees
+them immediately via refcounting — the `gc.collect()` calls were pure
+overhead. Removed from both `bm25_retrieval.ipynb` and
+`embedding_retrieval.ipynb`'s chunked writers (confirmed directly:
+`embedding_retrieval.ipynb`'s equivalent write step took ~2+ hours with
+these calls in place and dropped to minutes once removed).
+
+Same `BUILD_LARGE_ONLY` flag/convention as Q1: `DATASETS` is
+`["ebnerd_large", "mind_large"]` when `True`, skipping
+`ebnerd`/`ebnerd_small`/`mind` entirely (never read, never written) rather
+than recomputing already-good results. Progress (dataset load, retrieval
+cache building — logged every 50,000 users given `ebnerd_large`'s ~800K+
+eval-user population, recall@K computation, output write) is appended to
+the same `build_progress.log` Q1 writes to, so a single tailed file covers
+the whole Q1-Q5 pipeline across separate notebook processes.
+
+Two tests were adjusted so they don't silently pass vacuously under
+`BUILD_LARGE_ONLY`: the null-abstract corpus-alignment check no longer
+hardcodes `"mind"` (which isn't in scope when `DATASETS` is large-only) —
+it searches `DATASETS` for whichever dataset actually has null abstracts.
+
 # Q3 — Semantic Candidate Generation (Embeddings)
 
 ## 1. Embedding source
@@ -497,6 +752,74 @@ Functions: `mean_pool(article_ids, embedding_lookup) -> np.ndarray`,
 
 # Manual Review upto here
 
+## 10. Scale: `ebnerd_large`/`mind_large`
+
+Same `polars`/`BUILD_LARGE_ONLY` treatment as Q2 (see Q2 #10): column
+projection at load (`articles` → `article_id` only, since title/abstract
+aren't needed once embeddings exist; `behaviors` →
+`user_id, article_ids_clicked, split`; `history` →
+`user_id, article_id_sequence`), `DATASETS` swapped to
+`["ebnerd_large", "mind_large"]` under `BUILD_LARGE_ONLY`, progress appended
+to the shared `build_progress.log`. Requires
+`data/processed/ebnerd_large/article_embeddings.parquet` and
+`data/processed/mind_large/article_embeddings.parquet` to already exist —
+i.e. `compute_embeddings_kaggle.ipynb` must be run on Kaggle for these two
+catalogs first (its `DATASET_PATTERNS`/`EXPECTED_PREFIXES` dicts were
+extended to discover `ebnerd_large_articles.parquet`/
+`mind_large_articles.parquet`, matched-and-excluded before the plainer
+`ebnerd`/`mind` patterns, same ordering trick already used for
+`ebnerd_small`).
+
+**Write step**: same two-part fix as Q2 #10 (`write_topk_parquet_chunked` +
+`pyarrow.parquet.ParquetWriter` merge), since `embedding_topk.parquet` has
+the identical shape (one row per retrieved user, two 200-element list
+columns) and hit the identical OOM at the identical scale. Also where the
+`gc.collect()` slowdown documented in Q2 #10 was actually *found*: this
+notebook's write step took ~2+ hours with `gc.collect()` calls in the
+chunk-write/merge loop and dropped to under 2 minutes once they were
+removed — confirmed by direct comparison on the same run.
+
+**`batched_top_k` results-list accumulation (a second, distinct OOM, not
+covered by the write-step fix above)**: `batched_top_k` processes queries in
+small internal batches, but accumulates *all* results into one Python list
+before returning. At `ebnerd_large` scale (821,111 queries × 200-item
+results ≈ 164M tuples), that list alone consumed enough memory that a
+*later* batch's own `np.argpartition` scratch array (`(BATCH_SIZE, n_docs)`
+int64, a few GB by itself) failed to allocate — `MemoryError`. Fixed two
+ways:
+1. The notebook now calls `batched_top_k` in `QUERY_CHUNK_SIZE = 50_000`-row
+   outer chunks instead of one call over all 821,111 queries, merging each
+   chunk's results into the running `user_topk` dict and discarding the
+   chunk's own result list before the next chunk starts.
+2. `BATCH_SIZE` (the notebook constant controlling `batched_top_k`'s
+   *internal* batching) was reduced from 2000 to 500: `ebnerd_large`'s
+   125,541-doc corpus makes the `argpartition` scratch array ~2x bigger than
+   what 2000 was originally sized for against the smaller datasets (max
+   65,238 docs) this constant predates.
+
+**Kernel-transport crashes (`WinError 10055` / `OSError: [WinError 10055]`,
+unrelated to memory)**: on this Windows machine, long-running Jupyter
+kernels intermittently died with a low-level ZeroMQ socket error (`No
+buffer space available` / `error not defined`) — not a Python exception,
+not correlated with any specific cell, and reproducing at the exact point
+several separate runs otherwise succeeded. Root cause: the default asyncio
+event loop on Windows (`WindowsProactorEventLoopPolicy`) doesn't implement
+`add_reader`, so `ipykernel`/`tornado` falls back to an extra selector
+thread for ZMQ — a known source of socket-handling flakiness under
+prolonged use. Fixed by launching `nbconvert` through a small wrapper
+(`_run_nbconvert_selector_loop.py`) that calls
+`asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())`
+before invoking `nbconvert`'s own entrypoint — used for every Q3-Q5
+`nbconvert --execute` invocation from this point on. Not airtight (one run
+still needed a retry), but eliminated the crash in every run that
+previously hit it reliably.
+
+Confirmed successful run: `ebnerd_large` — 821,111 retrieved, 0 cold-start
+users; recall@200 = 0.0029 (val) / 0.0021 (test). `mind_large` — 415,122
+retrieved, 10,423 cold-start users (11,393 excluded val impressions / 11,270
+excluded test impressions); recall@200 = 0.0199 (val) / 0.0152 (test). Both
+`embedding_topk.parquet`/`embedding_metrics.json` round-trip correctly.
+
 # Q4 — Offline Evaluation Harness
 
 ## 1. Candidate-generation vs. re-ranking — the central design fork
@@ -647,6 +970,67 @@ raw-performance requirement, just correctness.
    (`{method: {split: {slice: {metric: {point, ci_lo, ci_hi}}}}}`) +
    round-trip test.
 
+## 9. Scale: `ebnerd_large`/`mind_large`
+
+Same `polars`/`BUILD_LARGE_ONLY`/`build_progress.log` treatment as Q2/Q3
+(see Q2 #10). This notebook's `behaviors` projection keeps
+`article_ids_inview` (needed for the re-ranking framing itself, unlike
+Q2/Q3) alongside `user_id, article_ids_clicked, split`; `articles` keeps
+`category` too (needed for intra-list diversity). The ranking-metrics loop
+logs progress every 200,000 impressions given the scale (`ebnerd_large`'s
+val+test split alone is ~14.2M impressions × 2 methods).
+
+The anti-gaming schema check (#7) was changed to read the schema straight
+off disk via `pl.read_parquet_schema(...)` rather than
+`feature_store[name]["behaviors"].columns` — the latter would only reflect
+this notebook's own column projection (a memory optimization, not the true
+persisted schema) and would have silently validated the wrong thing once
+column projection was introduced.
+
+**`evaluate_ranking`'s per-impression records, dicts → preallocated numpy
+arrays**: the original implementation appended one `dict` per impression
+(7+ keys: `auc`, `mrr`, `ndcg5`, `ndcg10`, `is_coldstart`, `is_head`,
+`top10_ids`, plus the join columns) to a growing Python list, then built one
+`pl.DataFrame` from that list. At `ebnerd_large`'s test-split scale (12.5M
+impressions), a `dict` per row costs several GB of pure Python
+object/dict-table overhead *beyond* the actual values — the same class of
+problem as Q2/Q3's chunked-write fixes, addressed here at construction time
+instead of at the write step. Fixed by preallocating one `numpy` array per
+scalar metric column (`np.empty(n_rows, dtype=...)`, filled by index during
+the scoring loop) and only using plain Python lists for the two genuinely
+variable-shape columns (`user_id`, `top10_ids`) — `pl.DataFrame` is then
+built once from these columns directly, no per-row dict ever constructed.
+
+**`cosine_similarity_subset`'s hidden `O(n_docs)`-per-call cost — the
+dominant cost of the whole embedding-scoring pass, found while debugging
+why Q5's run (which shares this exact code path) wasn't progressing**: the
+function rebuilt `id_to_idx = {aid: i for i, aid in enumerate(doc_ids)}` — a
+dict over the *entire* article catalog — and re-normalized the requested
+corpus subset, on *every single call*. This function is called once per
+impression by the `embedding` method's `score_inview` adapter (unlike the
+`bm25` adapter, which memoizes its own `id_to_idx` once per dataset outside
+the per-impression closure). At `ebnerd_large` scale (12.5M+ calls against a
+125,541-doc corpus), rebuilding a 125,541-entry dict per call is
+`O(n_docs)` work that should be `O(1)`, dwarfing the actual similarity
+computation (which only touches the small `article_ids_inview` subset).
+Fixed by changing `cosine_similarity_subset`'s signature
+(`cs4406m26_assignment1c1/embeddings.py`) to take a precomputed, row-normalized
+`corpus_unit` matrix and a precomputed `id_to_idx` dict as parameters instead
+of a raw `corpus_matrix`/`doc_ids` pair it re-derives internally — both are
+now built once per dataset in `make_score_inview_adapters` (mirroring the
+`bm25_fn` adapter's existing `id_to_idx` pattern exactly), reused across
+every impression. `normalize_rows` (formerly `_normalize_rows`, private) was
+made a public module function so callers can precompute the corpus
+normalization themselves; `batched_top_k`'s own internal usage is
+unaffected. Verified the new signature produces bit-identical output to the
+old one on synthetic data (same `id_to_idx`/`subset_ids` resolution, same
+edge cases — `None` query vector, an unresolvable subset ID) before trusting
+it on a real run. Measured end-to-end via Q5 (see Q5 #6): a run using the
+unfixed code was still on its *first* of eight `(dataset, split, method)`
+scoring passes after 2h21m; the fixed version completed all four
+`(dataset, method)` passes needed for Q5 (no `val` split there) in ~99
+minutes total, including setup and the round-trip test.
+
 # Q5 — Codabench Submission
 
 ## 1. Competitions
@@ -771,6 +1155,163 @@ comparison.
 
 Manual, one-time action per competition — not implementable. Leaderboard
 screenshots go into the design note (Q6) once submitted.
+
+## 6. Scale: `ebnerd_large`/`mind_large`
+
+Same `polars`/`BUILD_LARGE_ONLY`/`build_progress.log` treatment as Q2-Q4
+(see Q2 #10), plus one further optimization specific to this notebook: since
+Q5 only ever needs the `test` split (never `train`/`val`), `behaviors` is
+read via a lazy `pl.scan_parquet(...).filter(pl.col("split") == SPLIT)
+.select([...]).collect()` instead of an eager read-then-filter — the
+predicate and column projection are pushed down at scan time, so
+`ebnerd_large`'s ~12.2M non-test rows are never materialized in memory at
+all. `TXT_FILENAME` was extended with `ebnerd_large`/`mind_large` entries,
+each reusing its family's filename convention for local-format consistency
+only — neither is its own separate Codabench track (`ebnerd_large` is built
+from EB-NeRD's larger provider bundle, not `ebnerd_testset.zip`;
+`mind_large` from `MINDlarge_train`/`MINDlarge_dev`, not the real held-out
+`MINDlarge_test`), so **do not submit these two zips**, same caveat as
+`ebnerd_small` already carries (#3).
+
+The row-order-preservation trick (#4: compute in user-sorted order for the
+BM25 adapter's cache, write back in the source file's original order) is
+implemented via `pl.DataFrame.with_row_index("row_idx")` instead of pandas'
+implicit integer index — `row_idx` is added once right after the
+(already-order-preserving) scan/filter above, so it recovers the original
+file order exactly, then a `user_id`-sorted copy is used only to drive the
+scoring loop before writing back out keyed by `row_idx`.
+
+**Shares Q4's `cosine_similarity_subset` fix (see Q4 #9)** — this notebook's
+`embedding_fn` adapter is the same code shape as Q4's, so it carried the
+identical `O(n_docs)`-per-call bug. This is in fact where the bug's real-world
+impact was first *measured*: an earlier run of this notebook (unfixed) was
+still scoring its first `(dataset, method)` pair after 2h21m elapsed, with no
+way to tell whether it was progressing or stuck, because
+`generate_predictions`'s scoring loop originally had no intermediate progress
+logging at all (unlike Q2-Q4's per-N-impressions `log_progress` calls). Fixed
+both problems together: added the same `log_progress` cadence (every 200,000
+impressions) to `generate_predictions`, then applied Q4 #9's
+`cosine_similarity_subset` fix. The corrected run completed all four
+`(dataset, method)` combinations — ~12.9M impressions scored total across
+`ebnerd_large`'s and `mind_large`'s `test` splits — in ~99 minutes.
+
+## 7. `mind_large_test` — the real, submittable population
+
+`MINDlarge_test.zip` (downloaded separately, gitignored, extracted to
+`./MINDlarge_test/`) is the actual Codabench-scored blind test set for
+`codabench.org/competitions/13967` — unlike `mind_large` (built from
+`MINDlarge_train`/`MINDlarge_dev`, never submittable, see #6), this **is**
+the real held-out population. Handled by a standalone notebook,
+`src/mind_large_test_submission.ipynb`, rather than a sixth track through
+`build_pipeline.ipynb`/`bm25_retrieval.ipynb`/`embedding_retrieval.ipynb`/
+`evaluation_harness.ipynb`: its `behaviors.tsv` carries **no click labels at
+all** (`impressions` is a plain space-separated candidate list, no
+`-0`/`-1` suffix — the defining feature of a genuine blind test, confirmed
+by direct inspection), so Q2/Q3's recall@K and Q4's ranking metrics are
+undefined for it. Only Q5's re-ranking task applies.
+
+**Schema**: matches `mind_large`'s unified `articles`/`behaviors`/`history`
+schema exactly, with one deliberate exception — `article_ids_clicked` is
+left out of `behaviors` entirely rather than null-filled. This was a
+judgment call worth stating precisely: other MIND-only-null columns
+(`body`, `published_time`, `session_id`, `history`'s three sequence
+columns) are null because the *MIND format itself* never carries them, true
+for `mind`/`mind_large` too. `article_ids_clicked` is different in kind —
+`mind_large`'s own `behaviors.parquet` has real click data; its absence
+*here* is specific to this one file being a genuine blind competition test,
+not a MIND-format limitation. Null-filling it would visually blend a
+load-bearing fact (there is no ground truth for this population, which is
+*why* Q2-Q4 don't apply) into the same bucket as incidental format gaps.
+`split` is set to the constant `"test"` (accurate — this whole file *is*
+the held-out population, not something derived via a temporal cutoff, so
+recording it as `"test"` costs nothing extra and matches the vocabulary
+other tracks use). Initially shipped with a much-reduced schema
+(`article_id`/`title`/`abstract` and `impression_id`/`user_id`/
+`article_ids_inview` only) on the reasoning that nothing else reads this
+directory — corrected after direct pushback: `dataset`, `category`/
+`subcategory`, and `impression_time` all exist in the raw files for free
+and were dropped only because this notebook's own scoring code doesn't
+need them, which trades a consistent `data/processed/` contract for no
+real savings.
+
+**Embeddings**: `MINDlarge_test`'s 120,961-article catalog overlaps
+94,733/120,961 with `mind_large`'s already-embedded catalog; the other
+26,228 exist only in this file and need a dedicated Kaggle pass
+(`compute_embeddings_kaggle.ipynb`'s `DATASET_PATTERNS`/`EXPECTED_PREFIXES`
+extended with a `mind_large_test_new` entry, matched before the plainer
+`mind_large`/`mind` patterns). Only the missing 26,228 are re-encoded, not
+the full 120,961 — the embedding model is frozen/pretrained, so an
+already-computed embedding for unchanged article text is exactly reusable;
+re-encoding it would waste GPU time for identical output, not just be
+slower. Encoding *is* required for the missing 26,228 specifically because
+an embedding only exists once the model has actually run over that
+article's text — nothing about using a test article's own text this way
+leaks click-label information, since the model is never fit to any of this
+project's data at all (see PROMPTS.md for the fuller discussion). The
+notebook verifies this reuse directly, not just asserts it: after merging,
+an overlapping article's embedding is checked byte-identical against
+`mind_large`'s own stored vector, catching a merge bug that silently
+re-encodes everything instead of actually reusing anything.
+
+The notebook is designed to run in two sittings around this Kaggle step
+(a markdown cell marked **PAUSE HERE**) — verified directly that the first
+sitting's cells (parsing, gap-detection, and their tests) execute and
+persist correctly on their own, failing fast with a clear message exactly
+at the merge-embeddings cell when the Kaggle output isn't present yet,
+rather than partway through some other cell.
+
+## 8. `ebnerd_testset` — the real, submittable population
+
+`ebnerd_testset.zip` (downloaded separately, gitignored, extracted to
+`./ebnerd_testset/`) is EB-NeRD/RecSys 2024's actual Codabench-scored blind
+test set (`codabench.org/competitions/2469`) — same relationship to
+`ebnerd_large` as `mind_large_test` has to `mind_large` (#7): its
+`test/behaviors.parquet` has no `article_ids_clicked` column at all, so
+Q2-Q4 don't apply, only Q5's re-ranking. Handled by a standalone notebook,
+`src/ebnerd_testset_submission.ipynb`.
+
+**No Kaggle embeddings round needed**, unlike MIND's real test set — direct
+set-equality comparison (`test_raw_ids == existing_raw_ids`) found
+`ebnerd_testset/articles.parquet`'s 125,541 articles are *exactly*
+`ebnerd_large`'s existing, already-embedded catalog: zero missing, zero
+extra. This is a genuine structural difference from MIND, not an
+inconsistency in how the two are handled — EB-NeRD shares one static
+article pool across every split by design, while MIND's splits are
+time-windowed slices of a continuously-published pool (old articles still
+candidates in a later window; new articles published after an earlier
+window closed), so MIND's real test introduces 26,228 genuinely new
+articles where EB-NeRD's doesn't. `ebnerd_large`'s `articles.parquet`/
+`article_embeddings.parquet` are reused directly (no re-parsing, no
+re-encoding), with a hard `test_catalogs_identical` invariant test that
+fails loudly if a future zip revision ever breaks this assumption, rather
+than silently scoring candidates with no embedding.
+
+**`is_beyond_accuracy` bug found on first run**: `test/behaviors.parquet`
+carries 13,536,710 total rows, of which 200,000 are flagged
+`is_beyond_accuracy=True` — RecSys 2024's separate diversity-focused
+submission track, which this pipeline doesn't implement. The first run
+initially just carried this column through for transparency without acting
+on it, and crashed on the `impression_id` uniqueness test: direct
+inspection showed all 200,000 beyond-accuracy rows share the single
+literal `impression_id=0` — a sentinel, not a real per-impression ID (each
+row has its own genuine `user_id`/`session_id`, but the same placeholder
+impression ID stamped across all of them), which breaks both the
+uniqueness assumption and the one-line-per-impression submission format.
+Fixed by splitting the parsed table in two: `behaviors_all` (all
+13,536,710 rows, including `is_beyond_accuracy`, written to
+`data/processed/ebnerd_testset/behaviors.parquet` for transparency) and
+`behaviors_final = behaviors_all.filter(~pl.col("is_beyond_accuracy"))`
+(13,336,710 rows, used for scoring and `predictions.txt`) — the tests now
+assert both the full count and the filtered count/uniqueness explicitly,
+rather than assuming they're the same population.
+
+**Schema/embeddings/rest**: matches `mind_large_test`'s pattern exactly —
+`article_ids_clicked` left out (not null-filled, same reasoning as #7),
+`split` set to the constant `"test"`, `is_beyond_accuracy` added as the one
+EB-NeRD-specific extra column. Final verified run: 13,536,710 total rows
+parsed (13,336,710 accuracy-track + 200,000 beyond-accuracy excluded),
+807,677 distinct users, both `predictions.txt` zips (`embedding`/`bm25`)
+round-trip with exactly 13,336,710 lines each.
 
 # Q6 — Design Note
 
