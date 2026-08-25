@@ -547,3 +547,29 @@ not-for-Codabench-submission, since `ebnerd_small` isn't a real competition
 track) `predictions.txt` zip (Q5). Updated `SPEC.md` and `README.md`
 throughout to describe three dataset tracks instead of two.
 added before this can actually be resolved, same open follow-up as MIND's.
+
+### "look bro, i have written some parts of the design_note on my own, write the rest pls :) keep the formal followed in the assignment. Don't use overly complex words, use simple ones and don't use em-dashes. Match the writing style already present in the design note so far" (interrupted, then "you were interrupted, continue pls")
+
+Completed `design_note.tex` (Q6), which previously had only the Introduction
+and a half-finished BM-25 Preliminaries subsection. Read the assignment PDF
+and `SPEC.md` first, then pulled real numbers straight from the already
+executed notebooks' saved cell outputs (`bm25_retrieval.ipynb`,
+`embedding_retrieval.ipynb`, `evaluation_harness.ipynb`) instead of
+re-deriving or guessing figures, since `data/processed/` itself is
+gitignored and not present in the working tree. Finished the BM-25 formulas
+(IDF, document length normalization, final score), added one subsection per
+Q1-Q5 pulling each one's "why" from `SPEC.md`, and a Discussion section with
+a real recall@200 table, the AUC reversal between candidate-generation and
+re-ranking framings, dataset differences, and a 10x scale-breakdown list.
+Q5's subsection reports the still-unresolved Codabench submission failures
+honestly (candidate-set/impression-ID mismatches, root-caused to the wrong
+test population) rather than presenting Q5 as complete.
+
+The assignment caps the design note at 4 pages; the first full draft
+compiled to 6. Cut prose by roughly a third across every subsection,
+tightened margins and list spacing (no `enumitem`/`titlesec` available
+locally, so list spacing was tightened via a manual `\@listI` redefinition
+instead), and iterated by actually compiling with `latexmk` and checking the
+rendered page count and per-page character distribution each time, rather
+than guessing at length. Rendered each final page to a PNG for a visual
+proofread pass before finishing.
