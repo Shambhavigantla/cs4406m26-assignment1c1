@@ -1,12 +1,15 @@
 # CS4.406 Assignment 1 — EB-NeRD & MIND News Recommendation
 
-This repo builds a lexical + semantic retrieval pipeline over three news-recommendation
-dataset tracks: **EB-NeRD (demo)**, **EB-NeRD (small)**, and **MIND-small**. This
-document describes exactly how the raw data is laid out on disk, file by file, column
-by column, as downloaded from the sources in `assignments/Assignment1_v1.pdf`.
-EB-NeRD small shares EB-NeRD demo's exact file layout and column schema — only the
-row counts differ (a larger article catalog and user base) — so it isn't documented
-as a separate column-by-column section below.
+This repo builds a lexical + semantic retrieval pipeline over five news-recommendation
+dataset tracks: **EB-NeRD (demo)**, **EB-NeRD (small)**, **EB-NeRD (large)**,
+**MIND (small)**, and **MIND (large)** — plus the two real Codabench-scored test
+populations (`MINDlarge_test`, `ebnerd_testset`), handled by their own dedicated
+submission notebooks (see Q5 below). This document describes exactly how the raw
+data is laid out on disk, file by file, column by column, as downloaded from the
+sources in `assignments/Assignment1_v1.pdf`. EB-NeRD small/large share EB-NeRD
+demo's exact file layout and column schema — only the row counts differ (a larger
+article catalog and user base) — so they aren't documented as separate
+column-by-column sections below; likewise MIND large shares MIND small's TSV layout.
 
 ## Directory layout
 
@@ -338,6 +341,39 @@ bootstraps a 95% CI per `(dataset, method, split, slice, metric)`. Writes
 `eval_metrics.json` to `data/processed/{dataset}/`. Same `BUILD_LARGE_ONLY`
 flag/scope as Q1.
 
+**At `ebnerd_large`/`mind_large` scale**, set the `EVAL_DATASETS` env var to
+run one dataset per invocation (`nbconvert` launches a fresh kernel each
+time, so this is the only way to avoid holding both large datasets' feature
+stores/BM25 indexes/embedding matrices in one process at once — see
+`SPEC.md` Q4 #9):
+
+```bash
+EVAL_DATASETS=ebnerd_large uv run python evaluation_harness.py
+EVAL_DATASETS=mind_large uv run python evaluation_harness.py
+```
+
+(PowerShell: `$env:EVAL_DATASETS = "ebnerd_large"; uv run python evaluation_harness.py`)
+
+Every `(dataset, split, method)` scoring pass is checkpointed to
+`data/processed/_eval_checkpoints/{dataset}/` as it runs, so if a run is
+interrupted (this machine hits an intermittent `WinError 10055` kernel
+death at this scale, see `SPEC.md` Q4 #9), just re-run the same command —
+it resumes from the last completed chunk instead of restarting. If the
+notebook's final cells (bootstrap CI, `eval_metrics.json` write) keep
+crashing even with every `(split, method)` checkpoint already written, skip
+the notebook entirely for that last stretch:
+
+```bash
+uv run python _finish_eval_metrics_standalone.py ebnerd_large
+```
+
+Loads the four checkpoint files directly and reproduces the notebook's
+remaining logic with no Jupyter/`nbconvert` involved — see the script's own
+docstring and `SPEC.md` Q4 #9. It deliberately leaves the checkpoint
+directory in place after writing `eval_metrics.json`; delete
+`data/processed/_eval_checkpoints/{dataset}/` manually once you've checked
+the output looks right.
+
 Verify the bootstrap-CI timing claim in `SPEC.md` Q4 #5 (computationally
 trivial even at MIND's ~70K-impression test-split scale):
 
@@ -419,6 +455,26 @@ upload the `embedding` zip (embeddings scored better than BM25 in Q4's
 comparison on every dataset track). MIND is limited to one submission per
 day. Screenshot the resulting leaderboard score for the Q6 design note.
 
+## Build the design note (Q6)
+
+```bash
+pdflatex -interaction=nonstopmode design_note.tex
+pdflatex -interaction=nonstopmode design_note.tex
+```
+
+Run twice: the first pass writes `Section~\ref{...}` cross-references to
+`design_note.aux`, the second reads them back so they resolve correctly.
+Produces `design_note.pdf` (4 pages). Use plain `pdflatex`, not `latexmk` —
+`latexmk` is a Perl script, and this machine's MiKTeX install has no `perl`
+on `PATH` (`latexmk` fails with "MiKTeX could not find the script engine
+'perl'"). If `latexmk`/Perl is available on your machine, `latexmk -pdf
+design_note.tex` works too and additionally cleans up build artifacts.
+Otherwise, delete `design_note.aux`/`.log`/`.out` manually afterward — only
+`design_note.pdf` is a tracked deliverable.
+
 ## Dataset location
 
-dataset should be present in the local repo of the person running the code in the format as present in my local repo.
+Raw datasets are gitignored and must be placed at the repo root before running anything,
+matching the directory layout documented above: `ebnerd_demo/`, `ebnerd_small/`,
+`ebnerd_large/`, `MINDsmall_train/`, `MINDsmall_dev/`, `MINDlarge_train/`, `MINDlarge_dev/`,
+plus (for the real Codabench submissions) `MINDlarge_test/` and `ebnerd_testset/`.
