@@ -212,8 +212,18 @@ per-click timestamps) kept nullable rather than dropped.
 
 ```bash
 uv sync                 # installs runtime + notebook deps (pandas, pyarrow, ipykernel, jupyter, nbformat)
-uv run pytest           # run tests
 ```
+
+**`uv run pytest` reports "collected 0 items" — this is expected, not broken.**
+Per this project's convention, every feature cell in a notebook is followed by a
+test cell (`def test_...(): assert ...` immediately called, printing `ok: ...` on
+success — see any `src/*.ipynb`) rather than a standalone `test_*.py` file `pytest`
+can discover. There are 59 such test cells across the nine notebooks in `src/`, and
+they run as an integral part of executing each notebook top-to-bottom (via
+`nbconvert` or Jupyter directly) — every command in the "Rebuild"/"Run"/"Generate"
+sections below aborts loudly if any of its notebook's test cells fail, so a clean
+run of those commands *is* the test suite passing. `pytest` itself only exists as a
+declared dependency for tooling/IDE integration, not as this project's test runner.
 
 Exploratory notebook: [`src/explore_datasets.ipynb`](src/explore_datasets.ipynb) loads
 both datasets and displays the raw tables described above.
@@ -258,7 +268,7 @@ Verify the from-scratch-vs-`rank_bm25` performance claim in `SPEC.md` Q2 #1
 (the reason `bm25.py` is hand-built rather than a library call):
 
 ```bash
-uv run python scripts/benchmark_bm25.py
+uv run python benchmarks/benchmark_bm25.py
 ```
 
 Times `top_k` per query (built from a sample of val/test users' real click
@@ -316,7 +326,7 @@ Verify the brute-force-vs-FAISS performance claim in `SPEC.md` Q3 #2 (why no
 ANN library is used):
 
 ```bash
-uv run python scripts/benchmark_embeddings.py
+uv run python benchmarks/benchmark_embeddings.py
 ```
 
 Times the matmul and top-K-selection stages of `batched_top_k` separately,
@@ -378,7 +388,7 @@ Verify the bootstrap-CI timing claim in `SPEC.md` Q4 #5 (computationally
 trivial even at MIND's ~70K-impression test-split scale):
 
 ```bash
-uv run python scripts/benchmark_bootstrap_ci.py
+uv run python benchmarks/benchmark_bootstrap_ci.py
 ```
 
 Times `bootstrap_ci` (1,000 iterations) at each split's real impression
