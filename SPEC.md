@@ -1031,6 +1031,125 @@ scoring passes after 2h21m; the fixed version completed all four
 `(dataset, method)` passes needed for Q5 (no `val` split there) in ~99
 minutes total, including setup and the round-trip test.
 
+**Combined-dataset kernel crashes and checkpointed re-scoring
+(`ebnerd_large` + `mind_large` in one kernel)**: running this notebook
+against both large datasets together left under 0.3GB free out of 15.7GB
+total RAM before `ebnerd_large`'s 12.5M-row test split even started
+scoring, and the kernel died intermittently (`WinError 10055`) at
+inconsistent points across repeated runs — not tied to a fixed row count or
+elapsed time (a 3,000,000-row and a 1,000,000-row checkpoint interval both
+crashed at almost exactly their own chunk boundary despite very different
+wall-clock durations to reach it). Windows Event Viewer confirmed this is
+genuine system-wide memory exhaustion, not a Jupyter/ZMQ-specific quirk:
+`dwm.exe`/`Explorer.exe` themselves crashed with
+`STATUS_FATAL_MEMORY_EXHAUSTION` (`0xC00001AD`) at the same moments this
+notebook's kernel died. Fixed with four independent, composable measures:
+
+1. **`EVAL_DATASETS` env var** restricts a single invocation to one dataset
+   (comma-separated; unset runs the full default list). `nbconvert` launches
+   a fresh kernel per invocation, so running `ebnerd_large` and `mind_large`
+   as two separate invocations means neither process ever holds both
+   datasets' feature stores/BM25 indexes/embedding matrices at once.
+2. **`dataset_fully_cached(name)`** checks whether all four `(split,
+   method)` final checkpoints already exist for a dataset; when true, that
+   dataset's BM25 index, embedding matrix, and `score_inview` adapters are
+   never rebuilt (`bm25_index[name]`/`corpus[name]` set to `None`), since
+   `evaluate_ranking` would return straight from checkpoint and never call
+   `score_fn` again. `test_setup_aligned`/`test_score_inview_adapters` skip
+   a fully-cached dataset (`if fully_cached[name]: continue`). A resumed
+   run's setup cost is then proportional to what's left to do, not what's
+   already done.
+3. **Checkpointed, chunked `evaluate_ranking`**: each `(dataset, split,
+   method)` scoring pass is split into `CHUNK_SIZE = 200_000`-row chunks,
+   each written to its own file under `CHECKPOINT_DIR / dataset /
+   f"{split}_{method}_chunks/chunk_{c:03d}.parquet"` immediately after being
+   scored; an existing chunk is skipped on retry. Once every chunk for a
+   pass is done, they're concatenated into `CHECKPOINT_DIR / dataset /
+   f"{split}_{method}.parquet"` and the chunk directory is removed.
+   `evaluate_ranking` checks for this final checkpoint first and returns it
+   directly if present. All writes (per-chunk and the final merge) go
+   through write-then-`os.replace`: a crash landing mid-write on the direct
+   path twice produced a checkpoint that read back as corrupt ("File out of
+   specification" / "must end with PAR1") on the next resume; `os.replace`
+   is atomic on both Windows and POSIX, so the visible path is always either
+   absent or fully valid.
+4. **Redundant `.astype(np.float32)` removed** in
+   `make_score_inview_adapters`: `emb_matrix` is already `float32` (cast
+   once when `corpus[]` was built), so calling `.astype(np.float32)` on it
+   again unconditionally copies the full `(n_docs, 768)` matrix (~385MB at
+   `ebnerd_large` scale) before normalizing, for no reason. `normalize_rows`
+   is now called directly on the shared array (it returns a new array,
+   `matrix / norms`, and never mutates its input in place).
+
+A **duplicate-process race** was found and fixed operationally, not in
+code: killing a retry-wrapper's parent process via `Stop-Process` does not
+kill an already-spawned child process on Windows — orphaned children
+survive independently — which once let two full `evaluation_harness.ipynb`
+kernels run simultaneously against the same checkpoint directory, corrupting
+a checkpoint. Recovered by enumerating and killing the entire process tree
+(`Get-CimInstance Win32_Process` + `Stop-Process`, with a delayed re-check
+for late spawns) instead of the top-level process alone. An automatic
+retry wrapper (`_run_nbconvert_with_retries.py`) was tried as a mitigation
+for `WinError 10055`'s unpredictability, then deliberately discontinued in
+favor of a single-shot run → inspect → fix → rerun cycle: checkpointing
+already makes a manual rerun resume from exactly where it left off, and
+automatic retries made it harder to tell whether a fix actually worked
+versus just getting lucky on a later attempt.
+
+**`top10_ids` dropped once consumed**: after computing `ild`/`novelty` from
+it, `top10_ids` (a `List[str]` column of 10 article IDs per impression) is
+dropped from `ranking_results`, since nothing downstream reads it again
+(`compute_coverage` reads from Q2/Q3's own persisted `{method}_topk.parquet`
+files, not from `ranking_results`). At `ebnerd_large`'s ~28.5M-row combined
+val+test `ranking_results`, this is several GB; found necessary after a
+Rust/polars allocator panic (`memory allocation of 80000000 bytes failed`)
+during the bootstrap-CI step immediately after, on a machine already under
+confirmed genuine memory exhaustion.
+
+**`compute_bootstrap_metrics` — per-column filtering, not per-slice
+`DataFrame` filtering**: `group_by(["dataset", "split", "method"])` selects
+only the columns the function touches beforehand (`slim = ranking_results
+.select([...])`), rather than carrying every column (including `user_id`,
+never read here) into each group. For each slice, only the one metric
+column being bootstrapped is filtered (`group[metric].filter(mask)`),
+instead of filtering the whole multi-column `group` DataFrame per slice as
+an earlier version did — that version also wastefully duplicated `group` in
+full for the `"overall"` slice, whose mask
+(`pl.Series([True] * df.height)`) is a literal all-`True` no-op filter.
+`bootstrap_ci`'s `max_chunk_cells` parameter is also lowered from its 200M
+default to `20_000_000` at this call site, bounding a `(1000, n_rows)`-shaped
+resample-index allocation that would otherwise spike into multiple GB at
+`ebnerd_large`'s test-split scale; per `bootstrap_ci`'s own docstring, chunk
+size doesn't change the numerical result (`numpy`'s `Generator` produces the
+same stream regardless of batch size) — confirmed via a synthetic-data
+equivalence test before trusting it on real data.
+
+**Standalone metrics finisher (`_finish_eval_metrics_standalone.py`)**: even
+with every fix above and all four `(split, method)` checkpoints already
+safely written to disk, the notebook's remaining downstream cells
+(beyond-accuracy metrics, bootstrap CI, `eval_metrics.json` write) kept
+hitting the same intermittent kernel death inside Jupyter/`nbconvert`. Since
+the checkpoints already carry every column those remaining steps need
+(`auc`/`mrr`/`ndcg5`/`ndcg10`/`is_coldstart`/`is_head`/`top10_ids`), a plain
+script (`uv run python _finish_eval_metrics_standalone.py <dataset>`) loads
+them directly and reproduces the notebook's exact remaining logic (same
+`category_lookup`/`novelty_lookup` construction, the same leaner
+per-column-filtering `compute_bootstrap_metrics`, the same
+`eval_metrics.json` schema and round-trip check) with no Jupyter,
+`nbconvert`, or ZMQ involved at all, sidestepping the unreliable kernel
+layer entirely for this last stretch. It deliberately does not delete the
+checkpoint directory on success (unlike the notebook's own
+`write_eval_metrics`), since the checkpoints represent many hours of
+compute across many crash/retry cycles — cleanup is a manual step once the
+output has been checked.
+
+Confirmed successful run — `ebnerd_large`, from `eval_metrics.json`: bm25
+val (AUC 0.509, nDCG@10 0.454), bm25 test (AUC 0.501, nDCG@10 0.435),
+embedding val (AUC 0.559, nDCG@10 0.483), embedding test (AUC 0.552,
+nDCG@10 0.465); coverage bm25 0.987, embedding 0.778 — the same direction as
+every smaller dataset track (embedding beats bm25 on ranking AUC/nDCG, bm25
+covers more of the catalog).
+
 # Q5 — Codabench Submission
 
 ## 1. Competitions
@@ -1315,31 +1434,35 @@ round-trip with exactly 13,336,710 lines each.
 
 # Q6 — Design Note
 
-Lives at `design_note.tex` (LaTeX skeleton already in the repo:
-Introduction/Design/Discussion sections, currently empty) → `design_note.pdf`,
-≤4 pages. Content maps onto the existing skeleton:
+Lives at `design_note.tex` → `design_note.pdf`, built with `latexmk -pdf`,
+4 pages. Section cross-references use `Section~\ref{...}` (not `\S`), so
+every reference is both spelled out and, via `hyperref`, clickable.
 
-- **Introduction**: scope — both datasets, what pipeline stages were built
-  (Q1–Q5).
-- **Design**: per-question summary of what was built and key choices, one
-  subsection per Q1–Q5, each pulling its "why" directly from the
-  corresponding `SPEC.md` section (which already documents alternatives
-  considered and why — e.g. Q2's rank_bm25-vs-hand-rolled story, Q3's
-  embedding-source decision) rather than re-deriving that reasoning from
-  scratch.
-- **Discussion**: experimental observations — the Q3 lexical-vs-semantic
-  comparison table (recall@K by method/slice), dataset differences (EB-NeRD
-  vs. MIND: language, cold-start prevalence, popularity skew — numbers
-  already computed in Q2–Q4), leaderboard screenshots (Q5), and a scale
-  analysis ("where does this break at 10×") — concrete candidates already
-  identified while building Q1–Q4, not hypothetical: Q1's per-user Python
-  loops when building MIND's history table; Q2/Q3's per-user retrieval loops
-  (already required batching to stay fast at current scale — a 10×
-  corpus/user count would need this re-benchmarked, not assumed fine); the
-  brute-force embedding similarity matrix (~17GB at current MIND scale — 10×
-  users would need it, or the batch size, reconsidered); single-machine
-  pandas/parquet I/O as a ceiling before a real feature store (e.g. a
-  database or distributed format) would be needed.
+- **Introduction**: pipeline scope (both datasets, all variants) and the
+  four stages (unified schema, BM25, embeddings, evaluation).
+- **Design** (`Section 2`): a `Unified Schema` subsection (the three shared
+  tables, null-over-fabrication policy, dataset namespacing, and Q9's
+  anti-gaming enforcement at the schema level), one subsection per Q1–Q5
+  each pulling its "why" directly from the corresponding `SPEC.md` section,
+  and a `Code Optimizations` subsection — a bullet list, not a table, of
+  every measured performance/memory fix made across the project in the
+  order encountered, from Q2's BM25 rewrite through Q4's
+  checkpointing/standalone-script fixes (Q4 #9 above).
+- **Discussion** (`Section 3`): a `Results` subsection holding one table
+  with every core metric (recall@200, catalog coverage, AUC, nDCG@10)
+  across every dataset track and split; a `Lexical vs. Semantic Retrieval`
+  subsection that discusses that table in prose rather than repeating its
+  numbers; `Dataset Differences` (language, cold-start, popularity skew,
+  text length); and `Scaling to the Full Datasets: A Real Incident` — the
+  `WinError 10055` saga (Q4 #9), generalized to what a real 10x scale-up
+  would additionally need (full vectorization of Q1–Q3's per-user loops, a
+  real ANN index in place of the brute-force similarity matrix, a real
+  feature store in place of single-machine parquet I/O).
+- **Leaderboard screenshots** (end of the Q5 subsection): MIND's real,
+  scored `MINDlarge_test` leaderboard result for both methods (embedding
+  AUC 0.6174, rank 55; bm25 0.5797); EB-NeRD's submission shown as
+  accepted-and-queued, since Codabench's own evaluation queue had not
+  returned a score at writing time.
 
 # Q7 — Deliverables
 

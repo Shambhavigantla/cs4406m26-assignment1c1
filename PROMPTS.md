@@ -174,21 +174,6 @@ since GPU removes the concern that drove Q2's benchmark-first discipline),
 local repo stays at zero new ML dependencies and only reads the resulting
 parquet files.
 
-### "why are the embeddings in .parquet format? shouldnt they be in .vec format?"
-
-A genuine format-choice question, not a correction — explained the tradeoff
-(parquet: consistent with every other artifact this pipeline produces,
-typed/schema-enforced, carries the extra `dataset` column naturally; `.vec`:
-the standard word2vec-style IR interchange format, human-greppable, and what
-MIND's own provided KG embeddings happen to use — though that's just the
-legacy format Microsoft's original TransE tooling exported, not a convention
-this project chose, and those files aren't even used per Q3's design) and
-asked whether there was a specific downstream interoperability reason (e.g.
-loading into `gensim`) before proposing to actually change it. The user's
-next message moved on to a different, larger change (Colab → Kaggle) instead
-of answering this, so the format stayed parquet — worth re-raising if it
-resurfaces.
-
 ### "ok nvm i wont use colab, i'll use kaggle, so modify everything accordingly"
 
 Platform swap for Q3's hosted-GPU embedding step: replaced
@@ -462,14 +447,7 @@ only supports the `demo`/`small` bundles so far and needs a `testset` option
 added, then Q1's pipeline and this section's `generate_predictions` re-pointed
 at it once downloaded.
 
-### "i just downloaded ebnerd_small, do Q1 to Q5 on ebnerd small and generate me the submission zip"
-
-First attempt at this repointed `build_pipeline.ipynb`'s single `EBNERD`
-constant from `ebnerd_demo` to `ebnerd_small` in place, which would have
-silently destroyed the already-committed demo-based Q1-Q4 results the moment
-the pipeline was rerun.
-
-### "ok no hangon, you are modifying ebnerd to change it from demo to small. I dont want that, keep both the demo and small ones" (stated twice, first message got cut off)
+### "i just downloaded ebnerd_small, do Q1 to Q5 on ebnerd small and generate me the submission zip" / "ok no hangon, you are modifying ebnerd to change it from demo to small. I dont want that, keep both the demo and small ones" (stated twice, first message got cut off)
 
 Critical correction — caught an in-place overwrite of an established dataset
 before it landed. Two real design decisions were resolved via
@@ -487,37 +465,6 @@ built fresh: 20,738/477,534/18,827; `mind` unaffected). Standing lesson: never
 silently repoint a shared, already-established dataset path in place to add
 a new variant — treat it as additive, in its own namespace, unless
 explicitly told to replace.
-
-### "when i ran on kaggle, why did ebnerd small take less time than ebnerd demo? isnt' the small one larger?"
-
-A genuine "why does the data not match intuition" question, not a task —
-answered directly rather than guessed: `ebnerd_small`'s article catalog
-(20,738 rows) is larger than demo's (11,777), so if raw `model.encode()`
-throughput were the only factor, small should have taken longer. The more
-likely explanation is that per-run *fixed* costs — `pip install
-sentence-transformers`, downloading the ~1GB `paraphrase-xlm-r-multilingual-v1`
-model weights from Hugging Face, CUDA/cuDNN initialization — dominate total
-Kaggle notebook wall time far more than the actual encode step does at these
-corpus sizes, so whichever run happened to hit a faster network pull or a
-better-available GPU (T4 vs. P100, or a less-contended shared T4) can easily
-finish faster despite having more rows to encode. Secondary candidate: total
-tokens (not row count) drives `encode()` cost, so if `ebnerd_small`'s
-titles/abstracts are shorter on average, it can process more rows in less
-wall time.
-
-### "the @ebnerd_small_articles.parquet file, is it just a renamed version of the articles.parquet in ebnerd_small/ directory?" / "no sorry sorry, i upload the file in data/processed/ebnerd_small/articles.parquet and renamed it. Is it different from the file in the repo root?"
-
-Data-provenance question, verified by directly reading and diffing the
-parquet files rather than reasoning from memory. First answer: no — the raw
-`ebnerd_small/articles.parquet` (21 native EB-NeRD columns, int `article_id`)
-is structurally different from the root `ebnerd_small_articles.parquet` (8
-unified-schema columns, prefixed string `article_id`) that was actually
-uploaded to Kaggle; confirmed by reading both files' schemas directly. Once
-the user clarified they'd actually renamed a copy of
-`data/processed/ebnerd_small/articles.parquet` (the *processed* file, not
-the raw one), re-verified with `DataFrame.equals()` that it's byte-for-byte
-identical to the prepared root copy — confirming the correct file was
-uploaded.
 
 ### "ok then, article_embeddings.parquet is the vector file trained from kaggle. That part is done, you can now continute"
 
@@ -569,31 +516,19 @@ tracks (parametrized `build_mind_*` functions the same way `build_ebnerd_*`
 already were, since MIND's builders were still hardcoded to `"mind_"`).
 First real run was manually stopped by the user mid-execution (see below).
 
-### "stop the background process" (x2, over two separate runs)
+### "do you think using dask / polars is going to be helpful?" / "do the polars rewrite, i give you the go ahead to proceed with it"
 
-Both times, the named background task had already lost its own completion
-record, but the actual OS process (the notebook kernel) was still alive and
-consuming real CPU/memory. Verified this directly via `Get-Process`/
-`Get-CimInstance` before/after killing, rather than trusting the task
-tracker's "stopped" label at face value -- confirmed a live PID with
-non-trivial accumulated CPU time and multi-GB working set both times, then
-`Stop-Process -Force`'d it and re-checked that the PID was actually gone.
-
-### "do you think using dask / polars is going to be helpful?"
-
-Exploratory question, answered with a recommendation plus the main
-tradeoff rather than an exhaustive survey (per this session's style
-guidance): Polars over Dask, because the actual bottlenecks in
-`build_pipeline.ipynb` (single-threaded pandas TSV parsing for MINDlarge,
-and Python-object-per-list-element overhead in the `.apply()`/`.map()`
-prefix-namespacing transforms) are exactly what Polars' multi-threaded
-parser and native `list`/`str` expression API solve directly, whereas
-Dask's value (out-of-core chunking, multi-machine parallelism) doesn't
-apply here -- the data isn't clearly bigger than RAM going in, and Dask's
-list-column support is a worse fit for these specific transforms than
-Polars' expression API.
-
-### "do the polars rewrite, i give you the go ahead to proceed with it"
+The first was an exploratory question, answered with a recommendation plus
+the main tradeoff rather than an exhaustive survey: Polars over Dask,
+because the actual bottlenecks in `build_pipeline.ipynb` (single-threaded
+pandas TSV parsing for MINDlarge, and Python-object-per-list-element
+overhead in the `.apply()`/`.map()` prefix-namespacing transforms) are
+exactly what Polars' multi-threaded parser and native `list`/`str`
+expression API solve directly, whereas Dask's value (out-of-core chunking,
+multi-machine parallelism) doesn't apply here — the data isn't clearly
+bigger than RAM going in, and Dask's list-column support is a worse fit for
+these specific transforms than Polars' expression API. The user approved
+the rewrite on that basis.
 
 `uv add polars`, then validated the rewrite against already-verified pandas
 output (`ebnerd_small`, `mind`) in standalone scratch scripts *before*
@@ -639,14 +574,6 @@ bug as a named example, not just "it's faster"), the parquet-writer bug and
 fix, and the free-as-you-go memory pattern -- and backfilled this file with
 every prompt from this stretch of work that hadn't been logged yet.
 
-### "give me an introduction paragraph to write in the design note"
-
-A request for design-note text, not an instruction to edit the file --
-answered directly in chat rather than inserted into `design_note.tex`
-(which was confirmed empty at the time: just the three bare
-`\section{...}` headers). Logged here per the instruction to log important
-prompts, but no code/doc change resulted from it directly.
-
 ### "nono, dont do all the datasets at all, only do it for the large datasets, forget the small datasets for now, don't remove all existence of them from the repo, just during execution, don't execute them, also make sure you don't erase the results of the small and demo datasets from earlier runs"
 
 Correction -- a full 5-dataset rebuild was in flight (mid-OOM-debugging) when
@@ -664,12 +591,6 @@ convention. Relaunched with `BUILD_LARGE_ONLY=True`; both large tracks
 built and wrote successfully (verified via `build_progress.log` timestamps
 against the run's actual start time, confirming the three existing
 directories' mtimes predated this run).
-
-### "do you think even for BM25, we need kaggle GPUs?"
-
-Exploratory question, answered directly (2-3 sentences, no code change):
-BM25 is pure lexical/term-frequency scoring, CPU-only regardless of dataset
-size -- only Q3's embedding model needs a GPU.
 
 ### "ok then proceed with everything upto Q5, just let me know when you want me to run the ipynb file in kaggle gpu, also keep updating the build_progress.log file so that i can see whats going on" / "do the polars rewrite for all notebooks"
 
@@ -834,3 +755,98 @@ realistic pattern. Also noted the leakage argument doesn't depend on
 overlap percentage either way -- it depends on whether click labels cross
 into anything upstream of scoring, which they never do for either dataset,
 so both are equally sound despite the different overlap numbers.
+
+### "this multiple retry concept, stop that, i feel like if we keep running artifacts from prev run is taken into current run and causing issues, only run it once and then evaluate, then if issues arise, improve and evaluate again" / "get more diagnostic information" / "isn't there some kind of optimization you can do here?"
+
+A connected multi-step debugging arc for `evaluation_harness.ipynb` at
+`ebnerd_large`+`mind_large` scale, run together as one kernel. First: a
+standing correction to the automatic-retry mitigation for `WinError 10055`
+kernel deaths (`_run_nbconvert_with_retries.py`) — the user's instinct that
+blind retries risk reusing bad state from a prior partial run was directionally
+right (motivated tightening every checkpoint write to atomic `os.replace`,
+since two corruptions had already come from crash-mid-write), and the
+policy shifted to single-shot run → inspect → fix → rerun, relying on
+checkpointing (already in place) to make a manual rerun resume correctly
+rather than an automatic wrapper papering over an unfixed root cause.
+Second, asked to dig deeper rather than keep patching blind: pulled Windows
+Event Viewer's Application log and found `dwm.exe`/`Explorer.exe` crashing
+with `STATUS_FATAL_MEMORY_EXHAUSTION` (`0xC00001AD`) at the same moments
+this notebook's kernel died — the first hard evidence this was genuine
+system-wide memory exhaustion, not a Jupyter/ZMQ-specific quirk, which
+reframed every subsequent fix as "reduce real memory usage," not "work
+around a flaky socket." Third, in response to a real OOM still occurring
+after those fixes: found and fixed `dataset_fully_cached` — a dataset
+already fully checkpointed was still having its BM25 index and embedding
+matrix rebuilt on a resumed run, pure wasted memory once nothing would ever
+read them again. All three fixes (checkpointed/atomic `evaluate_ranking`,
+`EVAL_DATASETS` one-dataset-per-kernel scoping, `dataset_fully_cached`) are
+documented together in `SPEC.md` Q4 #9.
+
+### "these modifications that you have done, will they change the results for the other datasets?"
+
+Direct correctness challenge across every optimization made during the
+crash-debugging arc above (chunked checkpointing, atomic writes,
+`dataset_fully_cached`, the redundant `.astype(np.float32)` removal,
+`top10_ids` drop, `compute_bootstrap_metrics`'s per-column filtering, the
+`max_chunk_cells` reduction) — answered with a fix-by-fix justification of
+why each is result-preserving (chunking/order doesn't change any per-row
+computation; a cast removed was already a no-op cast; a dropped column was
+never read again; per-column filtering produces the same boolean mask
+applied to the same values; `bootstrap_ci`'s own docstring guarantees chunk
+size doesn't change its output), not just asserted. One of these
+(`compute_bootstrap_metrics`'s rewrite) was also checked directly, not just
+argued: ran the old and new filtering logic against synthetic data and
+confirmed identical output before trusting it on `ebnerd_large`.
+
+### "I could sidestep the whole issue: write a small standalone Python script (no Jupyter/nbconvert involved at all)... do this and if it works write this optimization in the design note along with the leaner compute bootstrap metrics"
+
+Approved building `_finish_eval_metrics_standalone.py` after every
+in-notebook fix above still left the harness's last few cells (beyond-
+accuracy metrics, bootstrap CI, `eval_metrics.json` write) hitting the same
+intermittent kernel death even with all four `(split, method)` checkpoints
+already safely on disk. Since those checkpoints already carry every column
+the remaining steps need, the script reproduces the notebook's exact
+remaining logic directly against the parquet files, with no Jupyter,
+`nbconvert`, or ZMQ involved — sidestepping the unreliable kernel layer
+entirely rather than continuing to chase an intermittent root cause. This
+is what actually completed `ebnerd_large`'s Q4 run end-to-end; documented in
+`SPEC.md` Q4 #9 per the commitment in this prompt.
+
+### "in the design note, remove the preliminaries section, instead write about the unified dataset more. Also add the screenshots as per the instructions in the assignment doc" / "the screenshots are present in the repo. See them. for ebnerd, mention that the submission on codabench was taking too long so its just present there"
+
+Required reading `assignments/Assignment1_v1.pdf` directly to confirm
+exactly what Q5/Q6 require (screenshots of leaderboard scores; four named
+discussion points) rather than guessing at "whatever the assignment doc
+wants." Replaced `design_note.tex`'s `Preliminaries` subsection with
+`Unified Schema` (the three shared tables, null-handling philosophy, dataset
+namespacing, Q9's anti-gaming tie-in). The user then pointed at three real
+screenshot files (`mind_results.png`, `mind_leaderboard_rank.png`,
+`ebnerd_results.png`) already sitting at the repo root — embedded them with
+MIND's real scores stated in prose (embedding AUC 0.6174 rank 55, bm25
+0.5797) and an explicit, honest caveat for EB-NeRD (Codabench's own
+evaluation queue hadn't returned a score at writing time — the screenshot
+shows the submission queued, not a scored row) rather than waiting on it or
+fabricating a placeholder score.
+
+### "Move the optimizations under Design section and don't write them in tabular format... 3.1 should be results and 3.2 should be lexical vs semantic retrieval which references values in the tables of 3.1... i want all the data to be in tabular format... remove the em-dashes... avoid long paragraphs" → "i meant use bullets" → "the bullets format looks too ai generated, keep the previous paragraph format only, use bullets only when absolutely necessary"
+
+A three-step iteration on `design_note.tex`'s structure and prose style,
+worth logging as one arc since the final instruction reversed the middle
+one. Moved the Code Optimizations writeup from a Discussion-section
+`longtable` into a Design-section bullet list; split Discussion into a
+`Results` subsection (one consolidated table: recall@200, coverage, AUC,
+nDCG@10 for every dataset/split/method, pulled fresh from each
+`eval_metrics.json`) and a `Lexical vs. Semantic Retrieval` subsection that
+discusses the table instead of restating its numbers; removed every
+stylistic em-dash (parenthetical `--` breaks), leaving genuine numeric-range
+en-dashes (`Q2--Q5`, `90--92%`) alone. First pass at "avoid long paragraphs"
+split prose into more, shorter paragraphs — the user clarified that made it
+look worse (more blank-line overhead, not less dense) and asked for bullet
+lists instead, so several sections were converted to itemize. The final
+message reversed that too: bullets read as too AI-generated for
+analytical/narrative content, so everything was reverted to flowing
+paragraph prose except two genuinely list-like sections that predated this
+whole exchange or are inherently a changelog (`Code Optimizations`,
+`Dataset Differences`) — standing lesson: prose is the default register for
+this document, bullets are reserved for content that's actually a list, not
+a formatting device for breaking up long text.
