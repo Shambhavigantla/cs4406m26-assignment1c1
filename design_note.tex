@@ -167,9 +167,10 @@ The Codabench competitions grade against a separate, hidden test population
 \texttt{test} split. MIND's 26{,}228 test-only articles (of 120{,}961) are re-encoded on a fresh
 Kaggle GPU pass; the rest reuse existing embeddings. EB-NeRD needs no new embeddings, since its
 test catalog was verified byte-for-byte identical to \code{ebnerd\_large}'s. Both wrote valid,
-round-trip-tested prediction zips (2{,}370{,}727 and 13{,}336{,}710 lines, matching each
-population's impression count exactly), submitting \code{embedding} per its Q4-measured edge
-(Section~\ref{sec:lexvssem}).
+round-trip-tested prediction zips (2{,}370{,}727 and 13{,}536{,}710 lines, matching each
+population's impression count exactly); both \code{bm25} and \code{embedding} were submitted for
+each population, letting Q4's method comparison (Section~\ref{sec:lexvssem}) be checked against
+each competition's own real leaderboard.
 \end{sloppypar}
 
 \subsubsection*{Leaderboard Screenshots}

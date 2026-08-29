@@ -1405,32 +1405,88 @@ re-encoding), with a hard `test_catalogs_identical` invariant test that
 fails loudly if a future zip revision ever breaks this assumption, rather
 than silently scoring candidates with no embedding.
 
-**`is_beyond_accuracy` bug found on first run**: `test/behaviors.parquet`
-carries 13,536,710 total rows, of which 200,000 are flagged
-`is_beyond_accuracy=True` — RecSys 2024's separate diversity-focused
-submission track, which this pipeline doesn't implement. The first run
-initially just carried this column through for transparency without acting
-on it, and crashed on the `impression_id` uniqueness test: direct
-inspection showed all 200,000 beyond-accuracy rows share the single
-literal `impression_id=0` — a sentinel, not a real per-impression ID (each
-row has its own genuine `user_id`/`session_id`, but the same placeholder
-impression ID stamped across all of them), which breaks both the
-uniqueness assumption and the one-line-per-impression submission format.
-Fixed by splitting the parsed table in two: `behaviors_all` (all
-13,536,710 rows, including `is_beyond_accuracy`, written to
-`data/processed/ebnerd_testset/behaviors.parquet` for transparency) and
-`behaviors_final = behaviors_all.filter(~pl.col("is_beyond_accuracy"))`
-(13,336,710 rows, used for scoring and `predictions.txt`) — the tests now
-assert both the full count and the filtered count/uniqueness explicitly,
-rather than assuming they're the same population.
+**`is_beyond_accuracy` bug, found twice**: `test/behaviors.parquet` carries
+13,536,710 total rows, of which 200,000 are flagged `is_beyond_accuracy=True`
+— RecSys 2024's separate diversity-focused track. All 200,000 share the
+single literal `impression_id=0` (a sentinel, not a real per-impression ID —
+each row has its own genuine `user_id`/`session_id`, but the same
+placeholder impression ID) and one fixed 250-article `article_ids_inview`
+candidate list, confirmed by direct inspection.
+
+The first version of this notebook excluded these 200,000 rows from
+scoring/`predictions.txt` entirely, reasoning (wrongly) that the shared
+sentinel ID broke the one-line-per-impression format, and that since this
+pipeline doesn't implement diversity-specific re-ranking, submitting
+nothing for that population was the safe default. This produced a real
+Codabench submission failure inside their `score.py`
+(`ValueError: Length of values (0) does not match length of index
+(200000)`) — Codabench builds a 200,000-row lookup for the beyond-accuracy
+population and pulls the submitted ranks for it; submitting zero rows for
+that population is exactly what produced a length-0 result there. Confirmed
+against `ebnerd-benchmark`'s own reference example
+(`examples/beyond_accuracy/make_beyond_accuracy.ipynb`'s "Make a Submission
+file" cell: `pl.concat([df_behaviors, df_beyond_accuarcy])` before writing
+one `predictions.txt`) that there is no separate beyond-accuracy submission
+format — Codabench scores diversity/coverage/serendipity/novelty on top of
+whatever ranking is submitted for that population, using the same file.
+Fixed by removing the exclusion: `behaviors_final` is now `behaviors_all`
+unfiltered (200,000 more rows scored per method, with the same
+`score_inview` adapters, no special-casing needed — their
+`article_ids_inview` field already holds a valid, if shared, candidate
+list). The round-trip test's `impression_id` uniqueness check was narrowed
+to the accuracy-track rows only, since the beyond-accuracy rows' shared
+sentinel ID is now a deliberately-asserted invariant, not treated as a
+uniqueness violation.
+
+**`bm25`/`embedding` split across two `nbconvert` invocations**: this
+notebook has no checkpointing (unlike `evaluation_harness.ipynb`'s
+per-chunk checkpoints, Q4 #9), and scoring both methods sequentially in one
+kernel over 13.5M+ rows is a multi-hour session exposed to this machine's
+intermittent, still-unexplained `WinError 10055` kernel death (Q4 #9) for
+that entire duration — a crash partway through would lose both methods'
+progress, not just one. A `METHODS` env var (comma-separated, same
+convention as `evaluation_harness.ipynb`'s `EVAL_DATASETS`) restricts a
+single invocation to one method, so `bm25` and `embedding` run as two
+separate, shorter-lived kernels (`nbconvert` launches a fresh kernel per
+invocation): `METHODS=embedding uv run python
+_run_nbconvert_selector_loop.py src/ebnerd_testset_submission.ipynb 10800`,
+then the same with `METHODS=bm25`. The two invocations are run
+sequentially, not in parallel — each independently rebuilds its own copy of
+the BM25 index and embedding matrix from scratch, so running them
+concurrently would double that memory footprint for no benefit, unlike
+running both methods inside one already-loaded kernel (which shares the
+index/matrix build regardless of method count).
+
+**Even split, `generate_predictions` still needed checkpointing**: the
+`METHODS` split alone wasn't enough — the `embedding` run crashed to the
+same `WinError 10055` kernel death at 13,400,000/13,536,710 impressions
+(99% through), losing the entire pass since nothing had been persisted yet.
+Confirmed via Windows Event Viewer as the same genuine memory-exhaustion
+class as Q4 #9 (`dwm.exe` crashing with `STATUS_FATAL_MEMORY_EXHAUSTION`,
+`0xC00001AD`, at the same moment), not a new failure mode. Fixed with the
+same pattern as `evaluate_ranking` (Q4 #9): ranks are computed in
+`CHUNK_SIZE = 200_000`-row chunks (in the same user-sorted scoring order,
+for BM25 cache efficiency), each written to its own file under
+`data/processed/_predict_checkpoints/ebnerd_testset/{method}_chunks/` via
+write-then-`os.replace` immediately after scoring; an existing chunk is
+skipped on retry. Once every chunk for a method exists, they're
+concatenated into one final `{method}_ranks.parquet` checkpoint (same
+atomic-write pattern), and `generate_predictions` returns straight from
+that checkpoint on a fully-resumed call without rescoring anything. This
+merge step is unconditional — it runs every time the chunk loop completes
+without crashing, regardless of how many separate invocations it took to
+produce all the chunks, so no manual bookkeeping is needed across repeated
+crash/retry cycles.
 
 **Schema/embeddings/rest**: matches `mind_large_test`'s pattern exactly —
 `article_ids_clicked` left out (not null-filled, same reasoning as #7),
 `split` set to the constant `"test"`, `is_beyond_accuracy` added as the one
 EB-NeRD-specific extra column. Final verified run: 13,536,710 total rows
-parsed (13,336,710 accuracy-track + 200,000 beyond-accuracy excluded),
-807,677 distinct users, both `predictions.txt` zips (`embedding`/`bm25`)
-round-trip with exactly 13,336,710 lines each.
+parsed and scored (13,336,710 accuracy-track + 200,000 beyond-accuracy,
+both submitted together), 807,677 distinct users, both `predictions.txt`
+zips (`embedding`/`bm25`) round-trip with exactly 13,536,710 lines each —
+both are real Codabench submissions for this competition (unlike
+`ebnerd_large`'s/`ebnerd_small`'s zips, #3), so both get uploaded.
 
 # Q6 — Design Note
 

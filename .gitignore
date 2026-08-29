@@ -36,3 +36,6 @@ updates.md
 *.log
 *.out
 *.synctex.gz
+
+# Extras
+test_beyond_accuracy.py

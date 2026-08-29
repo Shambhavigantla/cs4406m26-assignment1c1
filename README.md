@@ -443,18 +443,32 @@ byte-identity, round-trip prediction counts) — a clean top-to-bottom run
 Requires `ebnerd_testset.zip` downloaded separately and extracted to
 `./ebnerd_testset/` (gitignored, not part of `data/raw`).
 
+Run once per method (`METHODS` env var, comma-separated; unset -> both) so a
+crash on this machine's intermittent `WinError 10055` kernel death only
+costs whichever method was running, not both — see `SPEC.md` §8:
+
 ```bash
-uv run python _run_nbconvert_selector_loop.py src/ebnerd_testset_submission.ipynb 10800
+METHODS=embedding uv run python _run_nbconvert_selector_loop.py src/ebnerd_testset_submission.ipynb 10800
+METHODS=bm25 uv run python _run_nbconvert_selector_loop.py src/ebnerd_testset_submission.ipynb 10800
 ```
+
+(PowerShell: `$env:METHODS = "embedding"; uv run python _run_nbconvert_selector_loop.py src/ebnerd_testset_submission.ipynb 10800`)
+
+Run the two sequentially, not in parallel — each independently rebuilds its
+own copy of the BM25 index and embedding matrix, so running them at the
+same time would double that memory footprint for no benefit.
 
 Executes [`src/ebnerd_testset_submission.ipynb`](src/ebnerd_testset_submission.ipynb)
 end-to-end (no Kaggle step needed — reuses `ebnerd_large`'s article catalog
 and embeddings directly, see `SPEC.md` §8) and writes
-`submissions/ebnerd_testset/ebnerd_testset_{embedding,bm25}_predictions.zip`.
-As above, the notebook's own test cells verify every numeric claim in
-`SPEC.md` §8 (catalog identity, the `is_beyond_accuracy`
-13,536,710-total/13,336,710-scored/200,000-excluded split, round-trip
-prediction counts) as part of running it.
+`submissions/ebnerd_testset/ebnerd_testset_{embedding,bm25}_predictions.zip`,
+each with all 13,536,710 rows scored and submitted (accuracy-track and
+beyond-accuracy rows together — see `SPEC.md` §8 for why an earlier version
+that excluded the 200,000 beyond-accuracy rows caused a real Codabench
+scoring crash). As above, the notebook's own test cells verify every
+numeric claim in `SPEC.md` §8 (catalog identity, the accuracy/beyond-accuracy
+row split, round-trip prediction counts) as part of running it. **Both**
+zips are real Codabench submissions for this competition — upload both.
 
 To submit either: register at
 [codabench.org/competitions/13967](https://www.codabench.org/competitions/13967/)
