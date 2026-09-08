@@ -1956,3 +1956,372 @@ analogous to (Q4 §7): the with/without comparison itself is deferred to
 Q3's ablation (recency-weighted vs. uniform history) and Q9's own
 with/without-session/dwell-time-features run, both of which reuse this
 notebook's output rather than duplicating feature computation.
+
+# A2 Q2 — Two-Stage Retrieve-Then-Rank
+
+## 1. Goal
+
+Stage 1 is Assignment 1's retrieval, unchanged: BM25 and embedding
+`score_inview` adapters over each impression's own `article_ids_inview`.
+Stage 2 is a LightGBM re-ranker trained on click labels that re-scores those
+same candidates. "Before" is the Stage-1-only ranking already recorded in
+`eval_metrics.json`; "after" is the identical impressions re-scored by the
+re-ranker, so the comparison isolates the re-ranker rather than a change of
+candidate set.
+
+## 2. Feature set
+
+Fifteen features, assembled positionally by `reranker.feature_matrix` from a
+fixed `FEATURE_COLUMNS` order. Order is fixed deliberately: LightGBM
+identifies features by position, so a booster trained on one column order and
+served on another produces silently wrong scores rather than an error.
+
+**Behavioural (11)** — from Q1's `reranker_features.parquet`:
+`click_count`, `weighted_category_affinity`, `weighted_read_time`,
+`weighted_scroll_percentage`, `weighted_embedding_similarity`,
+`position_in_impression`, `clicks_earlier_in_session`,
+`session_impressions_so_far`, `popularity`, `freshness_hours`,
+`category_match`.
+
+**Stage-1 retrieval (4)** — from `reranker_scores.parquet`: `bm25_score`,
+`embedding_score`, `in_bm25_top200`, `in_embedding_top200`.
+
+Nulls become NaN, which LightGBM treats as a first-class missing value and
+routes at each split. That is what lets one feature set serve both dataset
+families: MIND has no dwell-time, session or freshness data at all (A2 Q1 §2),
+so five columns are entirely NaN there and simply yield no split gain — no
+separate architecture, and no sentinel value a tree could mistake for a real
+measurement. Models are trained **per dataset** regardless: the catalogs,
+candidate counts (~11.9 vs ~37 per impression) and positive rates
+(`ebnerd_large` 9.02%, `mind_large` 4.10%) all differ.
+
+## 3. Retrieval scores: produced locally, on a sample
+
+`bm25_score`/`embedding_score` exist nowhere on disk after A1 — Q4's harness
+computes them live and keeps only per-impression metrics — so `A2 Q2` adds
+`src/reranker_scores.ipynb`, which persists them per `(impression_id,
+article_id)` into `reranker_scores.parquet`.
+
+**Local, not Kaggle.** The BM25 index and embedding matrix are built here, and
+Kaggle hosts only the GPU-bound training step — the same split used for the
+embeddings themselves. Scoring is also the expensive half, and a multi-hour
+loop fits a local machine better than a Kaggle session limit.
+
+**Sampled: `SCORE_IMPRESSIONS = {train: 400_000, val: 100_000}`, seed 0.**
+Every scored impression costs a BM25 query over the full catalog, and the
+measured rates are 517 impressions/s (`ebnerd_large`) and 323/s
+(`mind_large`). Scoring both splits in full would be ~2.0h and ~1.9h
+respectively against ~16min and ~26min sampled — ~4h versus ~45min — for a
+design matrix that is already 4,437,171 rows (`ebnerd_large`) and 14,721,197
+(`mind_large`) against 15 features. `test` is deliberately not scored: the
+serving adapter computes Stage-1 scores live, which is also what guarantees
+training-time and serving-time features are identical.
+
+The sample is uniform-random over impressions at a fixed seed, so it carries
+no systematic bias and preserves the positive rate. It also cannot corrupt
+the evaluation — the re-ranker is evaluated on the *full* val/test through the
+live adapter, so an undertrained model shows up as a worse measured metric
+rather than a hidden one.
+
+**The sufficiency of 400,000 is measured, not asserted.** The training
+notebook fits the same configuration on 100k/200k/400k-impression subsamples
+and reports validation AUC for each. A curve that has flattened by 400k is
+evidence that more scored impressions would not have helped; a still-rising
+curve is evidence the cap should be raised. Either way the design note
+reports the curve rather than a judgement call.
+
+## 4. Determinism: `sorted(set(query_tokens))` in `bm25.get_scores`
+
+`get_scores` accumulated its per-term contributions while iterating
+`set(query_tokens)`. Python randomizes string hashing per process, so the set
+iterated in a different order in every run, and float addition is not
+associative: identical input produced BM25 scores differing by ~5e-16
+relative across two processes (measured; within-impression rankings were
+unaffected, but the values were not reproducible). Iterating `sorted(set(...))`
+costs nothing on a query-sized token set and makes BM25 bit-reproducible —
+verified by checksumming the score vector from two separate processes.
+
+This was found by a feature-equivalence check in A2 that expected two runs to
+agree exactly; it applies equally to Q2/Q3/Q4's already-persisted artifacts,
+whose values were therefore reproducible only to ~1e-15 before this fix.
+
+## 5. Measured memory findings
+
+Same class of problem as A2 Q1 §8 — Arrow data materialized as Python
+objects — found three more times in this stage, each measured in isolation
+before being changed:
+
+| structure | cost at `ebnerd_large` | fix |
+|---|---|---|
+| full `history_lookup` dict | 8.61GB | truncate to last 20 clicks in Arrow → 1.27GB |
+| `top_k_membership` dicts | 164,222,200 ids **per method** | explode + left join in Arrow |
+| embedding matrix via list comprehension | 4.80GB peak, 39x slower | `.list.to_array(dim).to_numpy()` |
+
+Per-step peaks measured in isolated processes: history 6.05GB, BM25 index
+0.51GB, embeddings 4.80GB, sampling 5.64GB. **They stack** when everything is
+built before scoring, which is what produced a 12.13GB peak with free RAM at
+0.3GB on a 15.7GB machine. Sampling is therefore performed *before* the
+per-user lookups are constructed, so each transient occurs alone; the run
+then peaks at 11.53GB (`ebnerd_large`) and 8.69GB (`mind_large`) during setup
+and settles to ~4.4GB for the scoring loop itself. The residual setup
+transient is the sampling step reading `behaviors`' 5.47GB
+`article_ids_inview` column, which a per-chunk read would remove if this ever
+needs to run on a larger catalog.
+
+Every one of these rewrites was verified output-identical on the `ebnerd`
+demo track before being run at scale — scores equal within 1e-12 and
+membership flags bit-identical.
+
+## 6. One adapter implementation, shared between training and serving
+
+`bm25_score` and `embedding_score` are simultaneously *baselines* and
+*features*. That dual role makes a duplicated implementation a correctness
+risk rather than mere repetition: if the code that generated the training
+values and the code that generates them at serving time diverge at all, the
+input distribution shifts under a fixed model, silently and with no error.
+
+`cs4406m26_assignment1c1.retrieval.build_stage1_scorers` is therefore the
+single definition, used by `reranker_scores.ipynb` (training features),
+`reranker_evaluation.ipynb` (serving) and available to
+`evaluation_harness.ipynb`. It carries the memory shape established in §5:
+history truncated to the last 20 clicks in Arrow, embeddings converted
+columnar.
+
+The two prior copies were not quite identical, and the difference is
+recorded here because it decides which one the shared module follows.
+`evaluation_harness.ipynb` built its embedding lookup with `np.asarray(v)`
+over Python floats, so the *query* vector was pooled in float64 before being
+compared against a float32 corpus; `reranker_scores.ipynb` pools in float32
+throughout. Measured over 3,000 `ebnerd` val impressions the two differ by at
+most **1.192e-07** (float32 epsilon), with **zero ranking-order flips** and
+per-impression AUC equal to ten decimal places. The shared module follows the
+float32 path — matching the distribution the booster was actually fitted on
+matters more than matching the older harness — and A1's already-published
+baselines are unaffected. BM25 scores are bit-identical between all three.
+
+The adapter signature widens to `fn(user_id, article_ids_inview,
+impression_id=None)`. The behavioural features are per-impression
+(`position_in_impression`, `clicks_earlier_in_session`,
+`session_impressions_so_far`, `freshness_hours`), so a two-argument contract
+carrying no impression identity cannot express the re-ranker at all. BM25 and
+embedding accept and ignore the third argument.
+
+## 7. Evaluation population: common, sampled, and verified representative
+
+All three methods are scored on one common set of `EVAL_IMPRESSIONS = 200_000`
+impressions per split per dataset, drawn at `EVAL_SEED = 0`. Two independent
+reasons:
+
+1. **The paired CI requires it.** `paired_bootstrap_ci` (§8) resamples one
+   index set and applies it to both methods' per-impression arrays. That is
+   only meaningful if position *i* denotes the same impression in both.
+2. **Full coverage is unaffordable on one of the two datasets.** The
+   re-ranker consumes `bm25_score`/`embedding_score` as features, so
+   evaluating an impression requires a full Stage-1 pass over it. After A1,
+   those scores exist on disk for 500,000 sampled impressions only (400k
+   train, 100k val) and for **no test impression at all**.
+
+Throughput measured from the per-chunk checkpoint timestamps in
+`build_progress.log`, restricted to 50,000-**impression** chunks (A1's
+`evaluate_ranking` and `feature_engineering` log an identically-shaped line
+for 200,000-**row** chunks, and mixing the two inflates the figure by ~2x):
+
+| pass | `ebnerd_large` | `mind_large` |
+|---|---|---|
+| training-feature scoring (`reranker_scores`, train split) | 527 imp/s | 324 imp/s |
+| evaluation scoring (`reranker_evaluation`, val/test) | ~430 imp/s | ~283 imp/s |
+
+The evaluation pass is the slower of the two — it also materializes the click
+labels, and val/test impressions carry more candidates than train's (11.95 vs
+11.12 on `ebnerd_large`) — so it is the rate that governs this decision:
+
+| dataset | val+test impressions | full-population Stage-1 cost | at 200k/split |
+|---|---|---|---|
+| `mind_large` | 807,988 | ~48 min | ~24 min |
+| `ebnerd_large` | 14,245,374 | **~9.2 h** | ~16 min |
+
+The sample is not *assumed* representative. `eval_metrics.json` holds BM25 and
+embedding measured over every val and test impression, so
+`write_reranker_eval_metrics` re-measures those same two methods on the sample
+and asserts the sample's own 95% CI covers the full-population point estimate
+— the correct direction, since the sample is the noisy measurement and the
+full population is the reference. A skewed draw (toward short inview sets,
+heavy users, a narrow time window) fails that assertion rather than hiding
+inside the comparison. The check is recorded per split under
+`sample_agreement` in `reranker_eval_metrics.json`.
+
+## 8. `evaluation.paired_bootstrap_ci`
+
+A2 Q3 requires a 95% CI on the baseline-vs-improved difference that excludes
+zero. `bootstrap_ci` is single-sample and cannot express this: two independent
+intervals that happen to overlap do **not** imply the difference is
+insignificant. Per-impression difficulty is shared between methods — a
+one-candidate impression is easy for both, a 40-candidate one hard for both —
+and that shared variance cancels in the difference. Resampling one index array
+and applying it to both is what makes it cancel; drawing two independent index
+sets discards the pairing and degrades to the weaker unpaired test.
+
+Implementation differences the resampling: `mean(b[idx]) - mean(a[idx])` and
+`mean((b-a)[idx])` are identical because means are linear, and differencing
+first halves both memory and fancy-indexing work. Chunked by
+`max_chunk_cells` exactly like `bootstrap_ci`, for the same reason (a
+single-shot `(1000, 12.5M)` index array would be ~100GB); because numpy fills
+row-major, chunked and unchunked runs are bit-identical at a fixed seed.
+
+Verified on synthetic data with a known +0.02 effect and shared
+per-impression difficulty: the interval covers the true effect and excludes
+zero; the paired interval is **6.7x tighter** than the unpaired one on the
+same data; a no-effect pair yields an interval containing zero; chunked
+equals unchunked exactly; shape mismatch and empty input raise.
+
+## 9. Training-set size: measured, not asserted
+
+The 400,000-impression training cap (§3) is justified by a learning curve
+rather than by argument. `reranker_training_kaggle.ipynb` fits the same
+configuration at 100k/200k/400k impressions on **nested** subsamples — the
+100k set is a subset of the 200k set, which is a subset of the 400k set — so
+successive points differ only by added data and the curve is not confounded
+by disjoint draws. Validation AUC (per impression):
+
+| training impressions | `ebnerd_large` | `mind_large` |
+|---|---|---|
+| 100,000 | 0.6701 | 0.6183 |
+| 200,000 | 0.6698 | 0.6176 |
+| 400,000 | 0.6655 | 0.6158 |
+
+The curve is flat to slightly declining on both datasets: 400,000 is not
+merely sufficient, it is past the point where added impressions help.
+`best_iteration` lands at 53 and 45 against a 2,000-round budget with
+50-round early stopping, so the models converge almost immediately. The
+binding constraint on this stage is the **feature set**, not the sample size,
+and the plotted curve is `reranker_learning_curve.png`.
+
+## 10. Evaluation pipeline shape
+
+`src/reranker_evaluation.ipynb` (wrapper: `reranker_evaluation.py`,
+`RERANK_EVAL_DATASETS` to scope a run to one dataset per kernel).
+
+1. Sample the evaluation population per (dataset, split); sort by
+   `impression_id` **before** sampling, since polars' `unique` dedupes by hash
+   with no ordering guarantee (§4), then re-sort by `user_id` so the BM25
+   one-entry cache hits on consecutive impressions.
+2. Stage-1 score, chunked at 50,000 impressions with atomic per-chunk
+   checkpoints; attach top-200 membership columnar.
+3. Join Q1's behavioural features (read back, never recomputed) and run the
+   booster.
+4. Per-impression `auc_impression`/`mrr`/`ndcg_at_k` — A1's functions
+   unchanged, so baselines and re-ranker are scored by identical code.
+5. Bootstrap CI per method, paired CI per (baseline, re-ranker) pair, the
+   `sample_agreement` check of §7, all persisted to
+   `reranker_eval_metrics.json`.
+
+Peak-avoidance follows §5's rule that separately-cheap transients stack: the
+BM25 index and embedding matrix are released as soon as scoring ends and
+before the metric frames are built, and the Stage-1 frames are released once
+the re-ranked frames (which contain every Stage-1 column) exist. A resume
+whose `reranker_eval_{split}.parquet` already exists skips Stage-1 entirely
+rather than loading scores it would discard.
+
+## 11. Assertions that caught real properties of the data
+
+Each of these failed on correct code and encodes something true about the
+datasets rather than a bug that was fixed:
+
+- **Duplicate clicks.** EB-NeRD lists the same article twice in one
+  impression's `article_ids_clicked` when a user clicked it twice — 3,608
+  such entries in `ebnerd_large` val, none in MIND. The per-candidate label
+  is boolean, so the label count must be compared against *distinct* clicked
+  ids. Every clicked article is in its impression's `article_ids_inview` on
+  both datasets (checked separately: a positive outside the inview set would
+  silently cap every metric).
+- **nDCG@10 can be lower than nDCG@5.** `ndcg_at_k` normalizes by IDCG@k over
+  `min(n_pos, k)` terms, so an impression with 6 clicks gets a 6-term IDCG@10
+  against a 5-term IDCG@5 — the denominator grows while the numerator need
+  not. A constructed 6-click case gives 1.000 vs 0.892. The monotonicity
+  check holds only where `n_pos <= 5`.
+- **uint32 -> uint64 -> float64.** polars' `len()` returns UInt32; numpy's
+  `cumsum` promotes that to uint64; there is no common integer type for int64
+  and uint64, so `np.concatenate([[0], np.cumsum(lengths)])` resolves to
+  float64, which cannot be used as a slice index. The accumulator is pinned
+  with `cumsum(dtype=np.int64)`.
+- **Score-spread checks must not assume ensemble size.** A wrong feature order
+  raises nothing; it produces a near-constant score. The check is that scores
+  separate candidates *within* an impression, not that a fixed number of
+  distinct values exists — the small-track smoke model has 4 trees and emits
+  976 distinct values where the Kaggle-trained models have 45-53 trees.
+
+## 12. Results
+
+Per-impression AUC over 200,000 impressions per split, every method scored on
+the identical impressions (`reranker_eval_metrics.json`):
+
+| dataset | split | BM25 | embedding | re-ranker |
+|---|---|---|---|---|
+| `ebnerd_large` | val | 0.5088 | 0.5597 | **0.6664** |
+| `ebnerd_large` | test | 0.5015 | 0.5511 | **0.6490** |
+| `mind_large` | val | 0.5584 | 0.6102 | **0.6158** |
+| `mind_large` | test | 0.5569 | 0.5944 | **0.6099** |
+
+Paired bootstrap 95% CI on the difference against the stronger Stage-1
+baseline (embedding), 1,000 iterations, same impressions on both sides. Every
+interval excludes zero:
+
+| dataset | split | Δ AUC | 95% CI | Δ nDCG@5 |
+|---|---|---|---|---|
+| `ebnerd_large` | val | +0.1066 | [+0.1050, +0.1082] | +21.6% |
+| `ebnerd_large` | test | +0.0979 | [+0.0964, +0.0996] | +22.1% |
+| `mind_large` | val | +0.0057 | [+0.0046, +0.0068] | +2.8% |
+| `mind_large` | test | +0.0155 | [+0.0145, +0.0166] | +5.5% |
+
+**Sample representativeness.** The check described in §7, run on all eight
+(dataset, split, baseline) combinations, comparing the sampled 200,000-impression
+estimate against A1's exhaustive measurement:
+
+| dataset | split | method | sampled | full population | abs diff |
+|---|---|---|---|---|---|
+| `ebnerd_large` | val | bm25 | 0.5088 | 0.5087 | 0.0001 |
+| `ebnerd_large` | val | embedding | 0.5597 | 0.5589 | 0.0008 |
+| `ebnerd_large` | test | bm25 | 0.5015 | 0.5012 | 0.0003 |
+| `ebnerd_large` | test | embedding | 0.5511 | 0.5518 | 0.0007 |
+| `mind_large` | val | bm25 | 0.5584 | 0.5590 | 0.0005 |
+| `mind_large` | val | embedding | 0.6102 | 0.6103 | 0.0001 |
+| `mind_large` | test | bm25 | 0.5569 | 0.5565 | 0.0004 |
+| `mind_large` | test | embedding | 0.5944 | 0.5939 | 0.0004 |
+
+Maximum disagreement 0.0008, and every full-population value falls inside the
+sample's own 95% CI. The ~9.2 hours of Stage-1 scoring that exhaustive
+coverage would have cost on `ebnerd_large` buys no measurable change in the
+comparison.
+
+**The gap between the two datasets is the substantive finding.** The
+re-ranker's advantage is roughly an order of magnitude larger on EB-NeRD
+(+0.10 AUC) than on MIND (+0.006 to +0.016), and the feature importances say
+why: seven of fifteen features carry zero split gain on `mind_large` against
+two on `ebnerd_large`.
+
+| zero-gain features | `ebnerd_large` | `mind_large` |
+|---|---|---|
+| `in_bm25_top200`, `in_embedding_top200` | both | both |
+| `weighted_read_time`, `weighted_scroll_percentage` | — | zero |
+| `clicks_earlier_in_session`, `session_impressions_so_far` | — | zero |
+| `freshness_hours` | **48.1% gain (largest)** | zero |
+
+Five of those are the columns MIND's raw data never contained (A2 Q1 §2), so
+the re-ranker is working from eight usable features there against thirteen on
+EB-NeRD — and the single most informative EB-NeRD feature, `freshness_hours`
+at 48.1% of total gain, is exactly one of the absent ones. The gain is
+therefore bounded by how much behavioural signal the log actually carries,
+not by the model: the same architecture, features and hyperparameters applied
+to a log without dwell-time, session or publish-time data recovers a small
+though statistically unambiguous improvement, while the same pipeline on a
+log that has them recovers a large one.
+
+**The two top-200 membership features are dead weight on both datasets.**
+Zero split gain everywhere, and not because the join failed: the flags are
+`True` on 0.68%/0.39% of `ebnerd_large` rows and 0.59%/0.45% of `mind_large`
+rows with no nulls. A user's corpus-wide top-200 simply almost never
+intersects the specific candidates that user is shown, which is the same
+candidate-set fork A1's Q4 already had to resolve (Q4 §1) reappearing as a
+feature-level result. They are retained in `FEATURE_COLUMNS` because removing
+them would invalidate the trained boosters' positional column order for no
+measured benefit, but they should be dropped if the models are ever retrained.

@@ -898,3 +898,51 @@ whole exchange or are inherently a changelog (`Code Optimizations`,
 `Dataset Differences`) — standing lesson: prose is the default register for
 this document, bullets are reserved for content that's actually a list, not
 a formatting device for breaking up long text.
+
+### "why is it reduced in stage 2 to 400k?" → "option 1, make sure you write the kaggle notebook accordingly and mention it in spec.md so that the design note can contain this info later"
+
+Stage 2 samples 400,000 `train` impressions where Stage 1 built features for
+all of them, and the question asked why. The honest answer was that the cap
+was a cost estimate, not a measurement: full-population Stage-1 scoring runs
+~4h per dataset locally against ~45min for the sample. Offered either
+keeping 400k with evidence, or raising it; the user chose the first and
+asked for the evidence to be built into the notebook rather than argued in
+prose. `reranker_training_kaggle.ipynb` now fits the same configuration at
+100k/200k/400k on **nested** subsamples (each a superset of the last, so
+successive points differ only by added data) and plots the curve.
+
+The result changed what the design note can claim. Validation AUC is flat to
+slightly *declining* — `ebnerd_large` 0.6701 → 0.6698 → 0.6655,
+`mind_large` 0.6183 → 0.6176 → 0.6158 — and both models early-stop at 45-53
+of 2,000 rounds. So 400,000 is not merely adequate, it is past the point
+where more data helps, and the binding constraint on this stage is the
+feature set rather than the sample size. That is a stronger and more
+defensible statement than the "sized carefully" story the cap was originally
+going to get, and it only exists because the check was asked for instead of
+the number being taken on trust. Written up as SPEC.md A2 Q2 §9.
+
+### "how did you get these baselines? did you run the ebnerd_benchmark code?"
+
+Asked after I quoted "BM25 0.520, embedding 0.564" as the numbers the
+re-ranker had to beat. No, and the question caught a real error in what I
+had presented. Those figures were a byproduct of a verification script that
+confirmed the Kaggle notebook's `per_impression_auc` matched
+`evaluation.auc_impression`, computed on a **3,000-impression subsample** of
+`ebnerd_large` val. Valid for showing two implementations agree; not a
+baseline measurement, and I should not have quoted it as one. The
+authoritative Stage-1 numbers come from Q4's harness over the full splits
+with 1,000-iteration bootstrap CIs — `ebnerd_large` val BM25 0.5087
+[0.5082, 0.5093] / embedding 0.5589, `mind_large` val 0.5590 / 0.6103 — and
+the CIs are ±0.0005, far tighter than a 3,000-impression sample can resolve.
+
+The question also separated two things the plan had let blur together: A2
+Q2's comparison is re-ranker vs. **our own** Stage-1 baselines, while the
+"reproduce a published baseline" requirement is Q3's NRMS, which is not
+started. `ebnerd-benchmark` is cloned and was read to ground the plan
+(confirming NRMS is TensorFlow/Keras and that `ebnerd_nrms_docvec.py` can
+consume our existing `article_embeddings.parquet`), but no code from it has
+been executed. Sampling for the Q2 comparison is now checked rather than
+assumed: `reranker_eval_metrics.json` carries a `sample_agreement` block
+asserting the sampled population's own CI covers the full-population
+baseline, so a skewed draw fails loudly instead of quietly shifting the
+"before" side of the comparison.

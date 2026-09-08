@@ -80,7 +80,15 @@ def build_index(doc_ids, doc_tokens: list[list[str]], k1: float = 1.5, b: float 
 
 def get_scores(index: BM25Index, query_tokens: list[str]) -> np.ndarray:
     scores = np.zeros(index.n_docs, dtype=np.float64)
-    for term in set(query_tokens):
+    # sorted(set(...)), not set(...): Python randomizes string hashing per
+    # process, so a bare set iterates its terms in a different order in every
+    # run. Float addition is not associative, so the accumulation order below
+    # changes the last bits of each score -- identical input produced scores
+    # differing by ~5e-16 relative across two runs (measured; within-impression
+    # rankings were unaffected, but the values were not reproducible).
+    # Sorting costs nothing on a query-sized token set and makes BM25
+    # bit-reproducible run to run.
+    for term in sorted(set(query_tokens)):
         entry = index.postings.get(term)
         if entry is None:
             continue

@@ -1,0 +1,160 @@
+% =====================================================================
+% CS4.406 IRE - Assignment 2 Design Note
+%
+% STATUS: SKELETON. Section bodies are placeholders except where marked
+% otherwise. Layout is deliberately NOT A1's: A2's brief gives a 6-page
+% *target* rather than a hard cap, so this uses real 1in margins, 11pt,
+% and default LaTeX spacing instead of the compressed titlespacing /
+% parskip=1.5pt / margin=0.5in that A1's 4-page cap forced.
+%
+% House style: prose by default. Bullets only for genuinely list-like
+% content (a changelog, a set of dataset differences) - not as a device
+% for breaking up long text.
+% =====================================================================
+
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{booktabs}
+
+\newcommand{\code}[1]{%
+    \colorbox{gray!40}{\texttt{#1}}%
+}
+
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+
+\title{IRE Assignment 2 Design Note\\\large Learning from Click-Logs on EB-NeRD and MIND}
+\author{Iman Kalyan Chakraborty - 2026801003}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\begin{center}
+\url{https://github.com/astrion-coder/cs4406m26-assignment1c1/}
+\end{center}
+
+\section{Introduction}
+\label{sec:intro}
+
+\todo{What A2 adds on top of A1's retrieval pipeline: behavioural features from
+the click-logs, a trained two-stage re-ranker, a reproduced NRMS baseline with a
+paired-bootstrap ablation, and a serving/scale analysis. Both datasets, large
+tracks, both Codabench leaderboards.}
+
+\section{Design}
+\label{sec:design}
+
+\subsection{Click-History and Session Features (Q1)}
+\label{sec:features}
+
+\todo{The fifteen features and where each comes from; recency weighting as real
+elapsed time on EB-NeRD versus an ordinal proxy on MIND; the five columns MIND
+never had; the behaviour-window boundary and why the current impression's own
+read time and scroll depth are deliberately excluded.}
+
+\subsection{The Re-Ranker (Q2)}
+\label{sec:reranker}
+
+\todo{Option A (GBDT/LightGBM) over Option B (small neural ranker), and why:
+NRMS is Q3's baseline, so choosing the neural ranker here would have collapsed
+the improvement and the thing it is measured against into one model. Training
+hosted on Kaggle, inference local. The learning curve that settled the 400k
+training cap.}
+
+\subsubsection*{Candidate set: why re-ranking operates on the in-view set}
+\label{sec:candidate-fork}
+
+% ---------------------------------------------------------------------
+% LOAD-BEARING PARAGRAPH - DO NOT DROP WHEN THIS SECTION IS WRITTEN OUT.
+% This is the justification for departing from the literal wording of Q2.1
+% ("use Assignment 1's candidate generator to retrieve top-K candidates").
+% Everything else in this subsection is scaffolding around it: the recall@200
+% ceiling, the Codabench format constraint, and the measured zero split gain
+% of the two membership features are the *evidence*, but this sentence is the
+% *claim* they support - that the two-stage structure the assignment asks for
+% is genuinely present, just wired through the retrieval scores rather than
+% through a precomputed top-200 list.
+% ---------------------------------------------------------------------
+So Stage 1 genuinely feeds Stage 2 --- just through ``how well does BM25 score
+this article for this user'' rather than ``is this article in the user's global
+top-200''. That is the same \code{score\_inview} adapter A1 built, reused
+unchanged, which is why the two-stage framing still holds.
+
+\todo{Build the argument that leads into the paragraph above: the top-200 is
+scored against the whole catalogue (125,541 / 104,151 articles) while re-ranking
+must operate on \code{article\_ids\_inview} (${\sim}12$ EB-NeRD, ${\sim}37$
+MIND); recall@200 of 0.2--3\% caps any metric the second stage could produce;
+both Codabench leaderboards require a permutation of the in-view set, so a
+ranking of our own top-200 is not submittable at all; and the two membership
+features that do encode top-200 overlap carry exactly zero split gain on both
+datasets, at 2.4--4.3$\times$ chance overlap. Note this fork was identified and
+documented during A1 (SPEC.md Q4 \S1), not retrofitted for A2.}
+
+\subsection{Baseline Reproduced, Then Beaten (Q3)}
+\label{sec:baseline}
+
+\todo{NRMS reproduction from the ebnerd-benchmark repo (EB-NeRD) and
+recommenders-team/recommenders (MIND), trained on Kaggle and exported to ONNX for
+local inference. The principled improvement, the ablation isolating it, and the
+paired bootstrap 95\% CI.}
+
+\subsection{Serving and Scale Analysis (Q4)}
+\label{sec:serving}
+
+\todo{Index memory, p99 latency for candidate generation plus feature assembly
+plus re-ranker scoring, and a back-of-envelope cost per 1000 queries at a target
+SLA.}
+
+\subsection{Code Optimizations}
+\label{sec:optimizations}
+
+\todo{The measured memory work: the Arrow-to-Python materialization class of bug
+found six times over, peak stacking, the streaming join that replaced two eager
+collects, and BM25 determinism via \code{sorted(set(...))}. List format is
+appropriate here - this section is a changelog.}
+
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Results}
+\label{sec:results}
+
+\todo{Consolidated table: AUC, MRR, nDCG@5, nDCG@10 before and after re-ranking,
+both datasets, val and test, with bootstrap CIs and the paired CI on each
+difference. Plus the sample-representativeness check against A1's
+full-population baselines.}
+
+\subsection{Why the Gain Differs Between the Two Datasets}
+\label{sec:dataset-gap}
+
+\todo{The substantive finding: EB-NeRD gains ${\sim}0.10$ AUC against MIND's
+0.006--0.016, because seven of fifteen features carry zero split gain on MIND
+versus two on EB-NeRD - and the single most informative EB-NeRD feature,
+\code{freshness\_hours} at 48\% of total gain, is one of the five MIND never
+had. Same model, same features, same hyperparameters; the ceiling is set by what
+the log records.}
+
+\subsection{Ablation and Statistical Significance}
+\label{sec:ablation}
+
+\todo{Ablation results with the paired bootstrap CI, and the Q9 with/without
+serving-time-features run.}
+
+\subsection{Where This Breaks at 10x}
+\label{sec:scaling}
+
+\todo{Feature-store joins at scale, brute-force cosine similarity needing a real
+ANN index, ranker-inference batching. Extend A1's genuine memory-exhaustion
+incident with what the re-ranking and serving stages specifically add.}
+
+\section{Leaderboard Submissions}
+\label{sec:leaderboard}
+
+\todo{Screenshots from both Codabench competitions.}
+
+\end{document}

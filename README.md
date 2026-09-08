@@ -526,6 +526,109 @@ Same chunked, atomically-written, resumable-on-crash checkpointing as Q4's
 `evaluate_ranking`/Q5's `generate_predictions` — a run interrupted mid-way
 resumes from the last completed chunk on re-run, no manual bookkeeping.
 
+## Score Stage-1 retrieval for the re-ranker (Assignment 2, Q2)
+
+```bash
+SCORE_DATASETS=ebnerd_large uv run python reranker_scores.py
+SCORE_DATASETS=mind_large uv run python reranker_scores.py
+```
+
+Executes [`src/reranker_scores.ipynb`](src/reranker_scores.ipynb): BM25 and
+embedding scores plus top-200 membership flags over a seeded sample of
+`train`/`val` impressions, joined against Q1's `reranker_features.parquet`
+into `reranker_training_{dataset}.parquet` — the design matrix uploaded to
+Kaggle. Requires `reranker_features.parquet` and `{bm25,embedding}_topk.parquet`.
+
+## Train the re-ranker (Assignment 2, Q2 — run on Kaggle)
+
+Upload `reranker_training_ebnerd_large.parquet` and
+`reranker_training_mind_large.parquet` as a Kaggle dataset, run
+[`src/reranker_training_kaggle.ipynb`](src/reranker_training_kaggle.ipynb)
+with Save & Run All (CPU is enough — LightGBM, no GPU), then download into
+`data/processed/{dataset}/`:
+
+- `reranker_model_{dataset}.txt`
+- `reranker_metadata_{dataset}.json`
+- `reranker_learning_curve.png` (repo root)
+
+Training is Kaggle-hosted for the same reason the embeddings were (A1 Q3);
+inference runs locally. The notebook fits the same configuration at
+100k/200k/400k impressions on nested subsamples first, so the training-set
+size is settled by a measured curve rather than by assertion.
+
+## Evaluate the re-ranker against Stage 1 (Assignment 2, Q2)
+
+```bash
+RERANK_EVAL_DATASETS=ebnerd_large uv run python reranker_evaluation.py
+RERANK_EVAL_DATASETS=mind_large uv run python reranker_evaluation.py
+```
+
+(PowerShell: `$env:RERANK_EVAL_DATASETS = "ebnerd_large"; uv run python reranker_evaluation.py`)
+
+Executes [`src/reranker_evaluation.ipynb`](src/reranker_evaluation.ipynb):
+scores BM25, embedding and the re-ranker on one common seeded sample of
+200,000 impressions per split, and writes
+`data/processed/{dataset}/reranker_eval_metrics.json` with each method's
+metrics, the **paired** bootstrap 95% CI on every baseline-vs-re-ranker
+difference, and a `sample_agreement` block asserting the sample reproduces
+the full-population baselines already in `eval_metrics.json`. Requires
+`reranker_model_{dataset}.txt` from the Kaggle step above.
+
+Run one dataset per invocation: the default holds both large datasets' BM25
+indexes and embedding matrices in one kernel, which does not fit in 16GB.
+Chunked and atomically checkpointed like every other long local loop here —
+an interrupted run resumes from the last completed chunk, and a split whose
+`reranker_eval_{split}.parquet` already exists is skipped entirely.
+
+### Verifying this section's numeric claims
+
+Stage-1 scoring throughput (`SPEC.md` A2 Q2 §7: 527 impressions/s on
+`ebnerd_large` and 324/s on `mind_large` for the training-feature pass, ~430/s
+and ~283/s for the slower evaluation pass, hence ~9.2h vs ~48min for the full
+val+test populations). Counts only 50,000-impression chunks — A1's
+`evaluate_ranking` logs an identically-shaped line for 200,000-row chunks:
+
+```bash
+uv run python benchmarks/verify_a2q2_claims.py throughput
+```
+
+The shared adapter module reproduces both prior implementations (§6:
+BM25 bit-identical; embedding within 1.192e-07 with zero ranking-order
+flips, because the old harness pooled the query vector in float64):
+
+```bash
+uv run python benchmarks/verify_a2q2_claims.py adapters
+```
+
+`paired_bootstrap_ci` behaviour (§8: covers a known +0.02 effect, excludes
+zero, ~6.7x tighter than the unpaired interval, chunked equals unchunked):
+
+```bash
+uv run python benchmarks/verify_a2q2_claims.py paired-ci
+```
+
+Dataset properties the assertions encode (§11: 3,608 duplicate clicks in
+`ebnerd_large` val and none in MIND; every clicked article present in its
+own inview set; nDCG@10 below nDCG@5 at 1.000 vs 0.892 for a 6-click
+impression):
+
+```bash
+uv run python benchmarks/verify_a2q2_claims.py data-properties
+```
+
+Learning curve and feature importances (§9), read straight from the
+downloaded Kaggle metadata:
+
+```bash
+uv run python benchmarks/verify_a2q2_claims.py learning-curve
+```
+
+All of them at once:
+
+```bash
+uv run python benchmarks/verify_a2q2_claims.py all
+```
+
 ## Dataset location
 
 Raw datasets are gitignored and must be placed at the repo root before running anything,

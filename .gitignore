@@ -46,4 +46,4 @@ recommenders/
 *.pt
 *.ckpt
 *.onnx
-reranker_model.txt
+reranker_model*.txt

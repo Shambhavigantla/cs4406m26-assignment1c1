@@ -103,6 +103,61 @@ def bootstrap_ci(
     return point, float(lo), float(hi)
 
 
+def paired_bootstrap_ci(
+    values_a, values_b, n_iterations: int = 1000, seed: int | None = None, max_chunk_cells: int = 200_000_000
+) -> tuple[float, float, float]:
+    """Bootstrap the *difference* `mean(values_b) - mean(values_a)` over the
+    same impressions; returns (mean_diff, ci_lo, ci_hi) at the 95% level.
+
+    `values_a` and `values_b` are per-impression metric values for two methods
+    scored on the *identical* impressions, in the same order -- A2 Q3 asks
+    whether the improved system beats the baseline, and the honest test of
+    that is paired, not two independent CIs. Two independent `bootstrap_ci`
+    calls whose intervals happen to overlap do NOT imply the difference is
+    insignificant: per-impression difficulty is shared between the methods
+    (an impression with one candidate is easy for both; a 40-candidate one is
+    hard for both), so that shared variance cancels in the difference and the
+    paired interval is typically far tighter than the overlap test suggests.
+    Resampling one index array and applying it to both arrays is what makes
+    it cancel; drawing two independent index sets would throw the pairing
+    away and reduce to the weaker unpaired test.
+
+    "Significant" for A2 Q3's purposes means the interval excludes zero:
+    `ci_lo > 0` (b beats a) or `ci_hi < 0` (a beats b).
+
+    Chunked exactly like `bootstrap_ci` and for the same reason -- see that
+    function's docstring for the ~100GB single-shot allocation this avoids at
+    ebnerd_large's test-split scale."""
+    values_a = np.asarray(values_a, dtype=np.float64)
+    values_b = np.asarray(values_b, dtype=np.float64)
+    if values_a.shape != values_b.shape:
+        raise ValueError(
+            f"paired_bootstrap_ci needs the same impressions in both arrays, "
+            f"got {values_a.shape} and {values_b.shape}"
+        )
+    n = len(values_a)
+    if n == 0:
+        raise ValueError("paired_bootstrap_ci is undefined for an empty slice")
+    # Difference first, then resample the differences: identical in
+    # distribution to resampling the pairs and differencing the means (means
+    # are linear), and it halves both the memory and the fancy-indexing work.
+    diff = values_b - values_a
+    point = float(diff.mean())
+    if n == 1:
+        return point, point, point
+    rng = np.random.default_rng(seed)
+    iters_per_chunk = max(1, max_chunk_cells // n)
+    resample_means = np.empty(n_iterations, dtype=np.float64)
+    start = 0
+    while start < n_iterations:
+        end = min(start + iters_per_chunk, n_iterations)
+        resample_idx = rng.integers(0, n, size=(end - start, n), dtype=np.int32)
+        resample_means[start:end] = diff[resample_idx].mean(axis=1)
+        start = end
+    lo, hi = np.percentile(resample_means, [2.5, 97.5])
+    return point, float(lo), float(hi)
+
+
 def intra_list_diversity(article_ids, category_lookup: dict) -> float:
     """1 - same_category(i,j) averaged over all pairs in the list. 0.0 for a
     list shorter than 2 items (no pairs) or an all-same-category list."""
