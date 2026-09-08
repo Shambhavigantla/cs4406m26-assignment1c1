@@ -1556,3 +1556,403 @@ needing new engineering:
   look-ahead fields (`next_read_time`, `next_scroll_percentage`) in the
   first place, so there's nothing to toggle — stated as a confirmation in
   Q4's harness output, not a separate mechanism.
+
+# Assignment 2 Spec
+
+Builds a trained re-ranker (Stage 2 of a retrieve-then-rank pipeline) on top
+of Assignment 1's unchanged Stage-1 retrieval, learned from click labels,
+plus a reproduced neural baseline and an extended evaluation harness. Reuses
+Assignment 1's unified schema, `evaluation.py`, `embeddings.py`, and
+`score_inview` adapter pattern unchanged unless stated otherwise below.
+
+# A2 Q1 — Click-History & Session Features
+
+## 1. Goal
+
+Produce a per-(impression, candidate-article) feature table
+(`reranker_features.parquet`) from behavioural signals already present in
+the unified schema (`history.timestamp_sequence`/`read_time_sequence`/
+`scroll_percentage_sequence`, `behaviors.session_id`) that A1 built but never
+consumed. This is Stage 1 input for Q2's re-ranker; Q2 additionally joins in
+`bm25_score`/`embedding_score` (from the existing `score_inview` adapters)
+and `in_bm25_top200`/`in_embedding_top200` (from the existing
+`{method}_topk.parquet` artifacts) — neither belongs here, since both are
+retrieval-method-specific rather than intrinsic behavioural signals.
+
+## 2. Output schema
+
+One row per `(impression_id, article_id)` pair, `article_id` ranging over
+that impression's `article_ids_inview`:
+
+| Column | Type | Notes |
+|---|---|---|
+| `impression_id`, `dataset`, `user_id`, `article_id`, `split` | string | join keys |
+| `clicked` | bool | training target — `article_id in article_ids_clicked` |
+| `click_count` | int | `len(history.article_id_sequence)` for this user |
+| `weighted_category_affinity` | float | see §4 |
+| `weighted_read_time` | float, nullable | null for MIND (never had dwell-time data) |
+| `weighted_scroll_percentage` | float, nullable | null for MIND |
+| `weighted_embedding_similarity` | float, nullable | see §5; null for empty history |
+| `position_in_impression` | int | 1-indexed position in `article_ids_inview`'s original order |
+| `clicks_earlier_in_session` | int, nullable | null for MIND (no session concept); see §6 |
+| `session_impressions_so_far` | int, nullable | null for MIND |
+| `popularity` | float | `train_popularity_lookup` (§7), shared with Q4's novelty metric |
+| `freshness_hours` | float, nullable | `impression_time − published_time`; null for MIND (`published_time` always null) |
+| `category_match` | bool | candidate's category ∈ this user's history category set |
+
+Per-dataset metadata (`recency_weight_basis`, `has_session_data`,
+`has_dwell_time`, `has_freshness`, row counts, the train-sample cap actually
+applied) is written to `feature_metrics.json` alongside the parquet, not as
+repeated per-row string columns — the same shape as `bm25_metrics.json`/
+`embedding_metrics.json`.
+
+**Deliberately excluded** (A2 Q9 content): the *current* impression's own
+`read_time`/`scroll_percentage`. These were correctly never unified into
+`behaviors` in A1 (Q1 §2) — they are the outcome of the very impression
+being scored, not a pre-impression signal, so adding them now would be
+leakage. Reported as a with/without-serving-time-features comparison in Q9,
+not toggled here.
+
+## 3. Recency weighting — per (user, impression), not per user
+
+A history click's recency weight is relative to *this* impression's
+`impression_time`, not a single fixed "now" per user — even though a user's
+`history.article_id_sequence` is itself a fixed, pre-collection-window
+snapshot reused across all of that user's val/test impressions (A1 Q1 §2).
+A click made 3 hours before the eval window's earliest impression has
+decayed further by the time a user's last test-split impression is scored
+days later; treating recency as a per-user constant would silently misprice
+that. Weight formulas (exponential half-life decay, closest to how
+recommendation systems commonly decay dwell/click signals):
+
+- **EB-NeRD** (`recency_weight_basis = "elapsed_time"`): real elapsed time is
+  known (`history.timestamp_sequence` is populated). `Δh = (impression_time −
+  timestamp_i).total_seconds() / 3600`; `weight_i = exp(−ln2 · Δh /
+  HALF_LIFE_HOURS)`, `HALF_LIFE_HOURS = 72.0` (a 3-day half-life — EB-NeRD's
+  history window is short, so a shorter half-life differentiates "yesterday"
+  from "last week" more than a multi-week one would).
+Capability flags are detected from **null counts, not column dtypes**. The
+two MIND tracks write the same semantically-absent columns with different
+types — `mind` as `Null`, `mind_large` as `String`, both 100% null (94,057
+and 750,434 rows respectively) — so a `dtype != pl.Null` test classified
+`mind_large` as having real timestamps and dwell-time data and derived
+elapsed-time recency weights from timestamps that do not exist. It surfaced
+as an `AttributeError` on a null row in `HistoryStore`, but the silent
+mislabeling was the actual defect. `test_setup` now asserts both MIND tracks
+resolve to identical MIND flags, and that an all-null column reads as "no
+data" under either dtype. Checked across all five tracks: only `mind_large`
+differed between the two detection methods, so no other output was affected.
+
+- **MIND** (`recency_weight_basis = "ordinal_proxy"`): MIND's raw data has no
+  per-click timestamps at all, ever (A1 Q1 §2) — only click *order* is
+  known. `rank_i` = position from the most recent click (0 = most recent);
+  `weight_i = exp(−ln2 · rank_i / HALF_LIFE_CLICKS)`, `HALF_LIFE_CLICKS =
+  5.0`. Never presented as an elapsed-time quantity in any output or plot —
+  `recency_weight_basis` is written to `feature_metrics.json` specifically
+  so this distinction survives into the design note.
+
+Computed once per impression (not cached per user, since the weight vector
+itself is impression-time-dependent) from a per-user history lookup dict
+(id/timestamp/read-time/scroll-percentage arrays, built once per dataset —
+same shape as Q4's `history_lookup` in `evaluation_harness.ipynb`). Empty
+history (cold-start) short-circuits to `click_count = 0`,
+`weighted_category_affinity = 0.0` for every candidate,
+`weighted_read_time`/`weighted_scroll_percentage`/`weighted_embedding_similarity`
+= null, `category_match = False` — a well-defined value, not an excluded
+row, consistent with Q4's cold-start-is-a-slice-not-an-exclusion framing.
+
+Individual `read_time_sequence`/`scroll_percentage_sequence` *entries* can
+be null even within a non-null, non-empty history — a real EB-NeRD data
+fact (16,510/18,827 `ebnerd_small` users have at least one such entry), not
+a pipeline bug. `weighted_read_time`/`weighted_scroll_percentage` average
+only the non-null entries against their matching recency weights; null only
+when *every* entry for that user is null (no usable dwell-time signal at
+all), not per-entry.
+
+## 4. `weighted_category_affinity`
+
+Per impression: `cat_weight[c] = Σ weight_i` over history items whose
+category is `c`; per candidate row: `weighted_category_affinity =
+cat_weight.get(candidate_category, 0.0) / Σ weight_i` — the fraction of a
+user's recency-weighted attention spent on the candidate's category,
+mathematically in `[0, 1]` (a ratio of a subset-sum to the full sum of the
+same weights, so floating-point summation order can push it a hair above
+1.0 — observed max `1.0000000000000004` on `ebnerd_small`, checked with a
+`1e-9` tolerance rather than a strict bound). Distinct from `category_match`
+(§2), which is an unweighted
+set-membership check; both are kept since they answer different questions
+("how much" vs. "at all").
+
+## 5. `weighted_embedding_similarity` and `embeddings.weighted_mean_pool`
+
+`embeddings.py` gains `weighted_mean_pool(article_ids, weights,
+embedding_lookup) -> np.ndarray | None`, a weighted generalization of the
+existing `mean_pool` (uniform weights must reduce to bit-identical output —
+enforced by a regression test in `feature_engineering.ipynb`, since this is
+the only thing standing between a subtle sign/normalization bug and every
+downstream feature that depends on it). Per impression, `weighted_mean_pool`
+over the user's full history (ids + this impression's recency weights)
+produces one pooled vector; `weighted_embedding_similarity` per candidate
+row is that vector's cosine similarity to the candidate's own embedding.
+
+The pooled vector itself is **not** persisted as a column — at
+`ebnerd_large` scale, a 768-float column repeated over every inview
+candidate would dominate the table's size for no benefit downstream (only
+the scalar similarity is ever consumed by the re-ranker). This differs from
+Q3/Q4's `embedding` adapter, which pools only the most recent
+`RECENT_N_CLICKS` clicks with uniform weights — `weighted_embedding_similarity`
+is a genuinely different feature (full history, recency-weighted), not a
+duplicate, and both are legitimately available to the Q2 re-ranker (the
+`embedding` adapter's score is joined in separately, per §1).
+
+## 6. Session features — vectorized, not a per-row loop
+
+`clicks_earlier_in_session` and `session_impressions_so_far` are computed
+directly from `behaviors` (`session_id`, `impression_time`,
+`article_ids_clicked`) with `polars` window functions over
+`(user_id, session_id)` ordered by `impression_time` —
+`session_impressions_so_far = cum_count() - 1` and
+`clicks_earlier_in_session = cum_sum(article_ids_clicked.list.len()).shift(1).fill_null(0)`,
+both `.over(["user_id", "session_id"])`. Unlike §3's history-based features,
+this needs no per-user Python-level lookup or per-impression recomputation —
+it is a property of the impression stream itself, computed once for the
+whole split in a single vectorized pass, then broadcast to every candidate
+row of that impression (same value for all of an impression's candidates).
+For MIND (`session_id` entirely null, `has_session_data = False`), both
+columns are null rather than computed against a meaningless single implicit
+session.
+
+## 7. `popularity` and `evaluation.train_popularity_lookup`
+
+`evaluation.py` gains `train_popularity_lookup(article_ids,
+train_clicked_lists) -> dict[str, float]`, factored out of what was
+inline logic in `evaluation_harness.ipynb`'s novelty-lookup cell (Q4 §3):
+add-one-smoothed `clicks_train(item) / total_train_clicks` for ever-clicked
+items, `1 / (total_train_clicks + n_articles)` for never-clicked items.
+`popularity` here is that same dict's raw value; Q4's `novelty` metric is
+`-log2(popularity)` — both now computed from one function so the harness and
+this notebook can never silently disagree on the formula. `evaluation_harness.ipynb`'s
+Q4 cell was refactored to call this function instead of duplicating the
+computation; verified bit-identical against `ebnerd_small`'s real train
+split (`max|old_novelty − new_novelty| == 0.0` over all 20,738 articles)
+rather than by rerunning the full `ebnerd_large`/`mind_large` harness for
+this refactor alone.
+
+## 8. `HistoryStore`: per-user history access without full materialization
+
+Per-user history access is served by a `HistoryStore` holding a
+`user_id -> row index` map plus the four `history` sequence columns as
+polars `Series`, slicing one row on demand and caching the most recent
+user. Two prior implementations were measured and rejected against real
+data, in this order:
+
+1. **`iter_rows(named=True)`** (one Python dict per row via polars'
+   row-iteration path): 0.76s for `ebnerd_small`'s 18,827 users, and at
+   `ebnerd_large`'s 974,791 users it had not finished after 8+ minutes.
+2. **Column-wise `.to_list()` + `zip`** into a fully-materialized dict:
+   0.07s on `ebnerd_small` — a 10.6x speedup over (1), byte-identical
+   output — but it fixed only construction *time*, not the *memory* the
+   result occupies, which is the binding constraint at scale.
+
+The materialized dict costs **182 bytes per history element** (`tracemalloc`,
+`ebnerd_small`: 445MB for 2,560,542 elements — Python `str`/`datetime`/`float`
+objects and their list containers, not the compact Arrow buffers the parquet
+holds). Applied to the real per-dataset element counts:
+
+| dataset | users | history elements | materialized |
+|---|---|---|---|
+| `ebnerd_small` | 18,827 | 2,560,542 | 445MB (measured) |
+| `mind_large` | 750,434 | 13,742,917 | ~2.3GB |
+| `ebnerd_large` | 974,791 | 131,918,897 | **~22.4GB** |
+
+`ebnerd_large` exceeds this machine's total RAM, and did so in practice: the
+first full-scale attempt was killed at 10.3GB resident and climbing, mid-way
+through building that dict, with a subsequent `Start-Process` call failing
+as `Starting the CLR failed with HRESULT 80004005` — the machine could not
+allocate for a new .NET runtime. This is the same genuine memory-exhaustion
+class as Q4 #9's `WinError 10055`, reached deterministically rather than
+intermittently.
+
+`HistoryStore` keeps only the index map (2.1MB per 18,827 users, so ~110MB
+projected at `ebnerd_large`) and materializes a single user's four sequences
+per `get()` (~58µs measured), bounding memory by history *length* instead of
+user *count*. The single-entry cache mirrors the BM25 adapter's last-user
+cache in `evaluation_harness.ipynb` and is effective for the same reason:
+`generate_features` iterates each split sorted by `user_id`, so a user's
+impressions arrive consecutively and only the first pays extraction cost —
+one extraction per *user* (~975K), not per *impression* (~16.2M).
+`test_setup` asserts `HistoryStore.get()` returns exactly what the
+materialized column would have, on both the cold and cached paths, plus the
+absent-user path.
+
+### Measured cost of every candidate at `ebnerd_large` scale
+
+Each step below was measured in isolation (peak RSS of the worker process,
+polled externally; `estimated_size()` for frames). Attribution mattered
+because the expensive steps mask each other: with the `.over()` session
+computation in the pipeline, sorted and unsorted source builds both measured
+~11.7GB and the sort looked free; with the sort present, adding the session
+join changed nothing and the join looked free. Only after making each step
+cheap in turn did the others' real costs appear.
+
+| step | peak | note |
+|---|---|---|
+| resident Arrow frames | 13.04GB | `behaviors` 7.83 (of which `article_ids_inview` 5.47), `history` 4.49, `embeddings` 0.72 |
+| `meta` projection (5 cols + `list.len()`) | 4.2GB | result is only 1.80GB |
+| session features via `.over()` | 9.34GB | 12.7s, result 0.68GB |
+| session features via sort + `forward_fill` | 6.26GB | 3.7s — **−3.1GB, 3.4x faster** |
+| split source: filter + sink | 7.48GB | baseline |
+| split source: + `sort("user_id")` | 11.18GB | **+3.7GB** |
+| split source: + session join (24.6M rows) | 11.48GB | **+4.0GB** |
+
+So both whole-split operations are pipeline breakers that materialize the
+split, and neither is worth its cost: the sort only feeds `HistoryStore`'s
+last-user cache (~58µs/impression, measured ~11% of throughput once removed:
+865 → 770 impressions/s), and the join is replaceable by joining each 200k
+chunk against the persisted session file, where polars hashes the small side.
+
+**The peaks stack.** Measured in isolation the source build peaks at 7.48GB,
+but inside the notebook it runs with `history` (4.49GB) and the embedding
+lookup already resident, and the observed process peak is 11.14GB against
+15.7GB of RAM. Building every split's source file *before* the per-user
+lookups are constructed would decouple the two (~7.5GB then ~5.5GB rather
+than ~11GB once); the current implementation does not, and the ~4GB of
+headroom is why the run survives rather than why it is safe. It did survive:
+the completed `ebnerd_large` run held a flat 11.14GB peak across all three
+source builds — the spike is dominated by scanning `behaviors.parquet`'s
+list columns, which is identical work regardless of split size, so the
+12,566,385-row test split cost no more than the 2,000,000-row train one —
+and sat at ~6-7GB for the ~4.5 hours of chunk processing in between. This
+is the change to make first if the dataset or the machine gets any larger.
+
+The same Arrow-to-Python materialization trap appears twice more in
+`generate_features`, and both are fixed the same way — keep data in Arrow,
+convert only what a chunk needs:
+
+- **Session features are persisted to a parquet, not held in a dict or
+  joined per split.** A `impression_id -> (clicks_earlier,
+  impressions_so_far)` dict costs 159 bytes per entry (`tracemalloc`,
+  `ebnerd_small`: 72MB for 477,534 impressions), i.e. ~3.65GB over
+  `ebnerd_large`'s 24,630,275 impressions, and covered the whole `behaviors`
+  table rather than only the rows a split processes (`train` is capped at
+  2,000,000 of 10,384,901). Joining them into each split's source instead
+  cost +4.0GB (table above). They are written once to
+  `_session_features.parquet` and joined per 200k chunk.
+- **The session computation avoids partitioned windows.** Sorting by
+  `(user_id, session_id, impression_time)` makes a group boundary a
+  row-to-row comparison, so a global `cum_sum`/row index, forward-filled
+  from each group's first row and subtracted, reproduces `.over()` exactly
+  at −3.1GB and 3.4x the speed. The comparison must be `ne_missing`, not
+  `!=`: `null != null` is null under three-valued logic while `.over()`
+  groups nulls together, so `!=` would split MIND's all-null `session_id`
+  into one group per row. Verified against the `.over()` reference on
+  `ebnerd`/`ebnerd_small`/`mind` and on a toy fixture covering a multi-row
+  session, a session boundary, and the all-null case.
+- **Per-chunk `.to_list()`, not per-split.** `article_ids_inview` averages
+  ~11.9 article-id strings per impression and the Arrow-to-Python conversion
+  interns nothing across rows (the same effect that forced
+  `evaluate_ranking`'s canonical-string pool, Q4 #9), so converting a whole
+  split up front would materialize ~150M Python strings (~9GB) for
+  `ebnerd_large`'s 12,566,385-impression test split. Slicing the split to
+  the current chunk first bounds this to ~2.4M strings, freed as soon as the
+  chunk parquet is written. It also means an already-checkpointed chunk
+  costs no conversion at all on a resume.
+
+The final merge uses `scan_parquet` + `sink_parquet` rather than reading
+every chunk eagerly and concatenating in memory, which would otherwise
+undo the per-chunk bound at the last step.
+
+Every file this notebook writes goes through write-to-`.tmp`-then-
+`os.replace` (`sink_parquet_atomic` for the streamed ones). The chunk writes
+always did; `_session_features.parquet` and `_source_{split}.parquet` did
+not, and both are guarded by "the file exists" checks, so a process killed
+mid-write would have left a truncated file that the next run silently
+accepted as complete. `os.replace` is atomic on Windows and POSIX, so a
+visible file is always either absent or whole.
+
+Every rewrite in this section was verified output-identical against the
+pre-refactor feature tables for all three small-scale tracks (`ebnerd`
+583,054 rows, `ebnerd_small` 5,514,689, `mind` 8,584,442; all 17 columns),
+compared after sorting on `(impression_id, article_id)` since dropping the
+sort changes row *order*, which is immaterial when every row carries its own
+keys.
+
+## 9. Scale, checkpointing, and observed throughput
+
+Validated end-to-end on `ebnerd` (583,054 output rows), `ebnerd_small`
+(5,514,689 rows, ~9.3 minutes) and `mind` (8,584,442 rows, ~68 seconds)
+before any large-scale run, per this project's standing scaling discipline.
+The ~8x per-impression
+throughput gap between the two (~700-900 impressions/s vs. ~3,500/s) traces
+to a real data fact, not an inefficiency: EB-NeRD's `history.article_id_sequence`
+averages 136 items/user (median 69) vs. MIND's 21.7 (median 12) — each
+impression's `compute_impression_history_summary` does `O(history length)`
+work (recency weights, category-weight accumulation, `weighted_mean_pool`),
+and that work is correctly recomputed per impression (not cached per user)
+because the recency weights themselves depend on that impression's own
+`impression_time` (§3). Final measured builds:
+
+| dataset | impressions | output rows | wall-clock | rate |
+|---|---|---|---|---|
+| `ebnerd` | 50,080 | 583,054 | ~1.5 min | ~600/s |
+| `ebnerd_small` | 477,534 | 5,514,689 | ~9.3 min | ~850/s |
+| `mind` | 230,117 | 8,584,442 | ~68 s | ~3,500/s |
+| `ebnerd_large` | 16,245,374 | 190,850,352 | **4h 54m** | ~920/s |
+| `mind_large` | 2,609,219 | 97,592,931 | **15m 17s** | ~2,850/s |
+
+`ebnerd_large` (2,000,000 capped train + 1,678,989 val + 12,566,385 test)
+produced a 3.17GB parquet and ran uninterrupted at a flat 11.14GB peak.
+`mind_large` (1,801,231 train — under the cap, so unsampled — plus 431,517
+val and 376,471 test) is ~6x smaller in impressions but only ~2x smaller in
+output rows, because MIND averages ~37 candidates per impression against
+EB-NeRD's ~11.9; its ~3x higher per-impression rate comes from far shallower
+histories (13,742,917 elements over 750,434 users, mean 18.3, vs.
+131,918,897 over 974,791, mean 135.3). A numpy-vectorized (`datetime64[us]`) rewrite of
+the per-item elapsed-time subtraction was benchmarked and rejected — at
+this array size (tens of items), numpy's per-call construction overhead
+(~24µs/call) is slower than the plain Python `datetime` subtraction loop it
+would replace (~4.5µs/call for 24 items); there is no cheap win here without
+changing what gets recomputed per impression, which would trade away the
+per-impression recency correctness the whole design is built around. Worth
+revisiting at Q4's serving-latency stage as a real speed/precision tradeoff
+(e.g. bucketing recency to coarser time granularity to allow caching), not
+as a change to this offline feature-table build.
+
+Full `val` + `test` splits (needed for Q3's offline evaluation regardless of
+Q2 training), plus a capped, seeded sample of `train` for re-ranker
+training: `TRAIN_SAMPLE_CAP = 2_000_000` impressions per dataset,
+`TRAIN_SAMPLE_SEED = 0` (`polars.DataFrame.sample`, without replacement,
+applied only when a split has more than the cap). At EB-NeRD's ~11
+candidates/impression average, this bounds `train`'s exploded row count to
+~22M/dataset; at MIND's ~37-40, ~74-80M/dataset — both in the low tens-of-GB
+range on disk, not the ~100-370M-row table an unsampled `ebnerd_large`/
+`mind_large` train split would explode to. Same chunked
+(`CHUNK_SIZE = 200_000` impressions), atomically-written (`os.replace`),
+resumable-on-crash checkpointing as every other long-running loop in this
+project (`evaluate_ranking`, `generate_predictions`), plus a
+`FEATURE_DATASETS` env var (mirrors `EVAL_DATASETS`) so `ebnerd_large` and
+`mind_large` are never built in the same kernel.
+
+## 10. Anti-gaming (Q9): recompute-from-truncated-input
+
+`test_no_future_leakage_in_features` asserts, for a sample of impressions,
+that every history item actually consumed has `timestamp_i <
+impression_time` (EB-NeRD) — mechanically guaranteed already since
+`history.article_id_sequence` is a pre-collection-window snapshot (A1 Q1
+§2), but checked directly against the real weight computation here rather
+than assumed. A second, stronger check: for one sampled user, manually
+truncate their history to a prefix, recompute `click_count`,
+`weighted_read_time`, and `weighted_scroll_percentage` by hand from that
+truncated input, and diff against the notebook's own output for an
+impression scored against the truncated history — must match up to
+floating-point tolerance (a weighted average of a single point equals that
+point mathematically, but `x*w/w` is not bit-exact for arbitrary `x, w` in
+IEEE 754). Skipped (not failed) on a `FEATURE_DATASETS`-scoped run with no
+elapsed_time-basis dataset present (e.g. MIND alone) — there is no
+timestamp data at all to run this specific check against in that case; the
+leakage check itself still runs for every dataset regardless of basis. This
+is the "features unavailable at serving time" toggle A1 had nothing
+analogous to (Q4 §7): the with/without comparison itself is deferred to
+Q3's ablation (recency-weighted vs. uniform history) and Q9's own
+with/without-session/dwell-time-features run, both of which reuse this
+notebook's output rather than duplicating feature computation.

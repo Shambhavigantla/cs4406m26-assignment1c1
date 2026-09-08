@@ -18,6 +18,22 @@ def mean_pool(article_ids, embedding_lookup: dict[str, np.ndarray]) -> np.ndarra
     return np.mean(vectors, axis=0)
 
 
+def weighted_mean_pool(article_ids, weights, embedding_lookup: dict[str, np.ndarray]) -> np.ndarray | None:
+    """Recency-weighted generalization of `mean_pool` (A2 SPEC.md Q1 #5) --
+    uniform weights must reduce to `mean_pool`'s exact output, checked by a
+    regression test wherever this is used. Falls back to an unweighted mean
+    if every matched weight is zero (an all-zero weight vector has no valid
+    weighted average, not that the history is uninformative)."""
+    pairs = [(embedding_lookup[aid], w) for aid, w in zip(article_ids, weights) if aid in embedding_lookup]
+    if not pairs:
+        return None
+    vectors, matched_weights = zip(*pairs)
+    matched_weights = np.asarray(matched_weights, dtype=np.float64)
+    if matched_weights.sum() == 0:
+        return np.mean(vectors, axis=0)
+    return np.average(vectors, axis=0, weights=matched_weights)
+
+
 def normalize_rows(matrix: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     norms[norms == 0] = 1.0

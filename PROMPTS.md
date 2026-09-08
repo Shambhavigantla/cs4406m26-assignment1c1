@@ -812,6 +812,54 @@ entirely rather than continuing to chase an intermittent root cause. This
 is what actually completed `ebnerd_large`'s Q4 run end-to-end; documented in
 `SPEC.md` Q4 #9 per the commitment in this prompt.
 
+### "i have added the part 2 of the assignment, it is titled A2.pdf. There we are told to use click-logs to build a reranker. Haven't we used the click logs already to build the top-K retrieval model?"
+
+Kicked off Assignment 2 scoping. Required reading `assignments/A2.pdf` in
+full to answer precisely: A1's use of click logs (building a fixed-formula
+query representation for BM25/cosine similarity) is categorically different
+from A2's requirement (a supervised model *trained* on click labels as the
+target variable, using richer engineered behavioral features, as an
+explicit second re-ranking stage on top of A1's unchanged retrieval). This
+distinction became the spine of the whole A2 plan. Four scope decisions
+were then confirmed directly rather than assumed: LightGBM GBDT trained in
+its own Kaggle-hosted notebook; one unified Q2/Q3 track (the re-ranker *is*
+the improvement compared against a reproduced NRMS baseline, not two
+separate exercises); full `ebnerd_large`/`mind_large` scale, not demo-only;
+a new `design_note_a2.tex` with a normal 1-inch-margin/11pt layout, since
+the user explicitly said A1's note ended up "too cluttered and close
+together" under its hard 4-page cap.
+
+### "for this baseline reproduction, will you again implement them from scratch or the repos... already contain simple runnable scripts...? also if you clone the benchmark repo for mind, make sure to add the name of the cloned folder in .gitignore" / "for kaggle, only the training happens, not inference. The inference i want to happen locally. Will it be too compute intensive? what do you think?"
+
+Two concrete architecture decisions for A2 Q3's baseline reproduction,
+folded into the plan before any code was written. First: reproduce means
+running the original authors' own code (`ebnerd-benchmark`'s
+`ebnerd_nrms_docvec.py`, and `recommenders-team/recommenders`'s NRMS-on-MIND
+notebook, cloned the same way `ebnerd-benchmark` already was) rather than
+reimplementing NRMS from scratch — the whole point of a baseline is
+numbers that actually match the published one. Second: assessed the
+training/inference split honestly rather than assuming it would just work —
+`NRMSDocVec` skips text encoding entirely (reuses A1's own
+`article_embeddings.parquet`), so per-impression local inference is the
+same order of magnitude as the embedding-retrieval matmul already
+benchmarked locally at ~7-12s for MIND's full val/test population; vanilla
+MIND NRMS is costlier per item but still a forward pass over the same
+multi-million-row shape BM25/embedding scoring already handled locally.
+
+### "× No solution found when resolving dependencies... Because all versions of tensorflow-cpu have no wheels with a matching Python version tag (e.g., cp314)... this error is coming"
+
+A real, live blocker the user hit running `uv add tensorflow-cpu`, pasted
+verbatim rather than described. Confirmed via `pyproject.toml`
+(`requires-python = ">=3.14"`) and the error's own hint (`tensorflow-cpu`
+wheels stop at `cp313`) that this was a genuine version-tag gap, not a
+transient resolver issue. Rather than downgrading the whole project's
+Python version for one dependency, verified `onnxruntime` resolves cleanly
+under the existing 3.14 environment (`uv pip install --dry-run
+onnxruntime`) and pivoted the plan: Kaggle-side `tf2onnx` export after
+training, local `onnxruntime` inference instead of raw TensorFlow — offered
+as one of three options via `AskUserQuestion`, with the ONNX path
+recommended and chosen.
+
 ### "in the design note, remove the preliminaries section, instead write about the unified dataset more. Also add the screenshots as per the instructions in the assignment doc" / "the screenshots are present in the repo. See them. for ebnerd, mention that the submission on codabench was taking too long so its just present there"
 
 Required reading `assignments/Assignment1_v1.pdf` directly to confirm

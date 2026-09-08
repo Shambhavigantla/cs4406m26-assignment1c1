@@ -7,6 +7,8 @@ formulas and the candidate-generation-vs-re-ranking framing these operate in.
 
 from __future__ import annotations
 
+from collections import Counter
+
 import numpy as np
 
 
@@ -124,6 +126,38 @@ def novelty(article_ids, novelty_lookup: dict) -> float:
     if not values:
         return 0.0
     return float(np.mean(values))
+
+
+def train_click_counts(train_clicked_lists) -> Counter:
+    """Per-article train-split click counts from an iterable of per-impression
+    clicked-id lists. Callers that can count more cheaply (e.g. a columnar
+    `explode().value_counts()`) should do so and pass the result straight to
+    `train_popularity_lookup` -- the formula, not the counting, is what has
+    to stay shared."""
+    counts = Counter()
+    for clicked in train_clicked_lists:
+        counts.update(clicked)
+    return counts
+
+
+def train_popularity_lookup(article_ids, click_counts) -> dict:
+    """Add-one-smoothed train-split click popularity: `clicks_train(item) /
+    total_train_clicks` for ever-clicked items, `1 / (total + n_articles)`
+    for never-clicked items. Shared basis for Q4's `novelty` metric
+    (`-log2(pop)`) and A2 Q1's `popularity` feature (`pop` itself) -- factored
+    out so both are computed once, the same way (A2 SPEC.md Q1 #7).
+
+    Takes an already-built `article_id -> count` mapping rather than the raw
+    per-impression lists: at ebnerd_large's 10,384,901-row train split,
+    materializing those lists as Python objects purely to count them is a
+    multi-GB cost the caller can avoid entirely (see A2 SPEC.md Q1 #8)."""
+    total = sum(click_counts.values())
+    n_articles = len(article_ids)
+    smoothed_zero_pop = 1.0 / (total + n_articles)
+    return {
+        aid: (click_counts[aid] / total if click_counts.get(aid, 0) > 0 else smoothed_zero_pop)
+        for aid in article_ids
+    }
 
 
 def coverage(retrieved_id_lists, n_articles: int) -> float:

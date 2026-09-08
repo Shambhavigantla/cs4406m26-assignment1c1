@@ -39,3 +39,11 @@ updates.md
 
 # Extras
 test_beyond_accuracy.py
+ebnerd-benchmark/
+recommenders/
+
+# A2 training/export artifacts (Q8 git policy)
+*.pt
+*.ckpt
+*.onnx
+reranker_model.txt

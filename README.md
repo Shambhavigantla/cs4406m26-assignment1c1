@@ -496,6 +496,36 @@ design_note.tex` works too and additionally cleans up build artifacts.
 Otherwise, delete `design_note.aux`/`.log`/`.out` manually afterward — only
 `design_note.pdf` is a tracked deliverable.
 
+## Build click-history & session features (Assignment 2, Q1)
+
+```bash
+uv run python feature_engineering.py
+```
+
+Requires the Q1 feature store and Q3's `article_embeddings.parquet` to
+already exist. Executes
+[`src/feature_engineering.ipynb`](src/feature_engineering.ipynb) end-to-end:
+builds `reranker_features.parquet` (one row per `(impression_id,
+article_id)` in `article_ids_inview`) and `feature_metrics.json` per
+dataset, from click-history/session signals in the unified schema that
+Assignment 1 built but never consumed (recency-weighted category affinity,
+dwell-time, and embedding similarity; session-scoped click counts;
+popularity; freshness; category match) — see `SPEC.md`'s `A2 Q1` section
+for the full design and `assignments/A2.pdf` for the assignment itself.
+Full `val`/`test`, a capped seeded sample of `train`. Same `BUILD_LARGE_ONLY`
+flag/scope as Q1, with a `FEATURE_DATASETS` env var mirroring `EVAL_DATASETS`:
+
+```bash
+FEATURE_DATASETS=ebnerd_large uv run python feature_engineering.py
+FEATURE_DATASETS=mind_large uv run python feature_engineering.py
+```
+
+(PowerShell: `$env:FEATURE_DATASETS = "ebnerd_large"; uv run python feature_engineering.py`)
+
+Same chunked, atomically-written, resumable-on-crash checkpointing as Q4's
+`evaluate_ranking`/Q5's `generate_predictions` — a run interrupted mid-way
+resumes from the last completed chunk on re-run, no manual bookkeeping.
+
 ## Dataset location
 
 Raw datasets are gitignored and must be placed at the repo root before running anything,
