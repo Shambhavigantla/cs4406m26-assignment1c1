@@ -946,3 +946,83 @@ assumed: `reranker_eval_metrics.json` carries a `sample_agreement` block
 asserting the sampled population's own CI covers the full-population
 baseline, so a skewed draw fails loudly instead of quietly shifting the
 "before" side of the comparison.
+
+### "For the assignment - Q3 part mentioned give a notebook runnable in kaggle - Baseline Reproduced, Then Beaten ... follow the repo structure according to the files given."
+
+Built A2 Q3 end to end. Three scoping decisions were put back to the user
+before any code was written, because each changed the deliverable and one
+contradicted the plan already recorded in `SPEC.md`:
+
+1. **One code path for both datasets.** `NRMSDocVec` from
+   `ebnerd-benchmark` applied to `ebnerd_large` *and* `mind_large`, rather
+   than pairing it with `recommenders-team`'s NRMS-on-MIND as the earlier
+   plan said. A1's unified schema plus A1 Q3's document vectors are exactly
+   the input `NRMSDocVec` expects, so one model, one hyperparameter set and
+   comparable numbers; the alternative meant two implementations, a
+   GloVe-tokenised title pipeline for MIND alone and a second dependency
+   stack expecting raw `MINDsmall` files. `SPEC.md`'s A2 Q3 section was
+   rewritten accordingly.
+2. **Everything in the Kaggle notebook**, replacing the "Kaggle trains,
+   local `onnxruntime` infers" split. Q3 items 2-4 all need inference: the
+   ablation needs three variants scored on one common population and the
+   paired CI needs their per-impression arrays aligned index for index, so
+   keeping training and scoring in one kernel makes that alignment
+   structural instead of something two processes must agree on.
+3. **The improvement is a recency prior on the history attention**, over a
+   candidate-aware user encoder or bolted-on category/freshness features.
+   It reuses A2 Q1's own two recency bases (elapsed time on EB-NeRD,
+   ordinal proxy on MIND), adds no parameters, is a one-line change to
+   `AttLayer2`'s exponent, and keeps the user vector candidate-independent -
+   which is what allows the scoring shortcut below. The rejected
+   alternatives would have cost that property (candidate-aware) or been
+   structurally near-null on MIND (freshness is one of the five columns MIND
+   never had).
+
+Two notebooks: `src/nrms_inputs.ipynb` (local, wrapper `nrms_inputs.py`)
+stages `data/kaggle_nrms/`, and `src/nrms_baseline_kaggle.ipynb` runs the
+four parts on Kaggle.
+
+Three things were designed rather than discovered, and are the parts worth
+defending:
+
+- **The ablation has three arms.** The recency layer also masks the
+  zero-padded history slots the baseline attends over - `exp(logit)` of a
+  zero document vector is not zero - and that is a real fix but not the
+  recency signal. `masked_uniform` (the same architecture fed all-zero
+  log-weights) sits between baseline and recency, so the two paired
+  intervals separate the mask from the signal, and the three point
+  estimates decompose exactly, which the notebook asserts.
+- **Zero log-weights must reproduce `AttLayer2` bit for bit.** Asserted
+  with `np.array_equal`, which is why the layer keeps the parent's
+  `+ K.epsilon()` denominator instead of a numerically stabler softmax: an
+  approximate reduction could not distinguish a real improvement from an
+  accidental reimplementation difference.
+- **The evaluation population is A2 Q2's, checked rather than assumed.**
+  `nrms_inputs.ipynb` draws val/test with Q2's own sampling function at
+  Q2's seed and, where `reranker_eval_{split}.parquet` exists, compares the
+  two impression-id lists element by element.
+
+Along the way, the authors' scoring path turned out to be redundant by
+construction: it flattens every (impression, candidate) pair into its own
+row, re-encoding the user's 20-click history once per candidate, when
+`NRMSDocVec` scores by a dot product of a history-only user vector and an
+article-only news vector. Encoding the catalogue once and the user once per
+impression removes a factor of ~11.9 (EB-NeRD) to ~37 (MIND) of
+news-encoder work per split; the notebook checks the shortcut against
+`model.scorer.predict` directly and reports the measured speedup, and the
+optimization went into `design_note_a2.tex` per this project's standing
+rule.
+
+Environment work that the notebook would not run without: `ebrec`'s layers
+are Keras 2 code (`K.dot`, `K.permute_dimensions`, `K.one_hot`, all removed
+in Keras 3), so `TF_USE_LEGACY_KERAS=1` is set before the first
+`import tensorflow` and `sys.modules["tensorflow.keras"]` is registered
+because `layers.py` does `import tensorflow.keras as keras`; the package is
+imported from a pinned clone rather than `pip install`ed, since it pins
+`polars==0.20.8`/`numpy<1.26.1`/`torch<2.3`; and their dataloader - the one
+piece that genuinely needs that polars, via `Expr.replace(default=...)` - is
+reimplemented in numpy and cross-checked against their sampler on a
+fixture. `benchmarks/verify_a2q3_claims.py` covers the section's claims,
+including a `metric-parity` check that parses both the notebook and
+`evaluation.py` and compares the restated estimators statement by
+statement.

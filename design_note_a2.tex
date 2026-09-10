@@ -98,10 +98,41 @@ documented during A1 (SPEC.md Q4 \S1), not retrofitted for A2.}
 \subsection{Baseline Reproduced, Then Beaten (Q3)}
 \label{sec:baseline}
 
-\todo{NRMS reproduction from the ebnerd-benchmark repo (EB-NeRD) and
-recommenders-team/recommenders (MIND), trained on Kaggle and exported to ONNX for
-local inference. The principled improvement, the ablation isolating it, and the
-paired bootstrap 95\% CI.}
+% ---------------------------------------------------------------------
+% DESIGN DECISIONS ARE SETTLED (SPEC.md A2 Q3); ONLY THE MEASURED NUMBERS
+% ARE OUTSTANDING. Keep the four points below when writing this out.
+% ---------------------------------------------------------------------
+The baseline is \code{NRMSDocVec} from \code{ebanalyse/ebnerd-benchmark},
+imported from a clone pinned at one commit and run unmodified --- the notebook
+asserts the checked-out revision and a clean working tree, so ``reproduction''
+means their code rather than a reimplementation of their paper. It runs on both
+datasets through the same code path, because A1's unified schema and A1 Q3's
+document vectors are exactly the input \code{NRMSDocVec} expects; the
+alternative of pairing it with \code{recommenders-team}'s NRMS-on-MIND would
+have meant two implementations, a GloVe-tokenised title pipeline for MIND
+alone, and MIND numbers not comparable to EB-NeRD's.
+
+The improvement is one term. \code{AttLayer2} pools a user's history
+order-blind and time-blind; the variant adds a recency log-weight to the
+attention exponent, so recency multiplies the learned attention rather than
+replacing it, with real elapsed time on EB-NeRD and the ordinal proxy on MIND
+--- A2 Q1's own two bases, not a third notion of recency. It adds no
+parameters, so all three variants have identical capacity, and it keeps the
+user vector candidate-independent, which is what makes the scoring shortcut in
+Section~\ref{sec:optimizations} possible.
+
+The ablation has three arms rather than two, because the recency layer also
+masks the zero-padded history slots the baseline attends over. That is a real
+fix and not the recency signal, so \code{masked\_uniform} --- the same
+architecture fed all-zero log-weights --- sits between them, and the two paired
+intervals separate the mask from the signal. The three point estimates
+decompose exactly, which the notebook asserts.
+
+\todo{The measured table: AUC/MRR/nDCG@5/nDCG@10 per variant per split per
+dataset with bootstrap CIs, the three paired 95\% CIs and which of them exclude
+zero, and where NRMS lands against A2 Q2's Stage-1 baselines and re-ranker on
+the same 200,000 impressions. Figures: \code{nrms\_ablation.png},
+\code{nrms\_paired\_ci.png}.}
 
 \subsection{Serving and Scale Analysis (Q4)}
 \label{sec:serving}
@@ -117,6 +148,19 @@ SLA.}
 found six times over, peak stacking, the streaming join that replaced two eager
 collects, and BM25 determinism via \code{sorted(set(...))}. List format is
 appropriate here - this section is a changelog.}
+
+\todo{Q3's scoring shortcut belongs in this changelog too. The
+\code{ebnerd-benchmark} scoring path flattens every (impression, candidate)
+pair into its own row, re-encoding the user's whole 20-click history once per
+candidate; since \code{NRMSDocVec} scores by a dot product of a history-only
+user vector and an article-only news vector, the news encoder can run once over
+the whole catalogue and the user encoder once per impression, removing a factor
+of ${\sim}11.9$ (EB-NeRD) to ${\sim}37$ (MIND) of encoder work per split. The
+notebook checks the shortcut against \code{model.scorer.predict} directly ---
+\code{sigmoid(dot)} within 1e-4, ranking flips counted --- and reports the
+measured speedup. Note also that this is why the improvement was chosen to keep
+the user vector candidate-independent: a candidate-aware encoder would give the
+factor back, offline and at serving time.}
 
 \section{Discussion}
 \label{sec:discussion}

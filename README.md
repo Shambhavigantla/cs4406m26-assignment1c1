@@ -629,6 +629,115 @@ All of them at once:
 uv run python benchmarks/verify_a2q2_claims.py all
 ```
 
+## Build the NRMS baseline inputs (Assignment 2, Q3)
+
+```bash
+uv run python nrms_inputs.py
+```
+
+(One dataset at a time: `NRMS_INPUT_DATASETS=mind_large uv run python nrms_inputs.py`;
+PowerShell: `$env:NRMS_INPUT_DATASETS = "mind_large"; uv run python nrms_inputs.py`)
+
+Executes [`src/nrms_inputs.ipynb`](src/nrms_inputs.ipynb): samples the
+`train` split (400,000 impressions, seed 0), re-draws A2 Q2's **exact**
+val/test evaluation populations (200,000 impressions per split, seed 0, via
+Q2's own sampling function), truncates each referenced user's click history
+to the last 20 items, stages A1 Q3's `article_embeddings.parquet`, and writes
+all of it plus a manifest to `data/kaggle_nrms/` for upload. Requires the Q1
+feature store and `article_embeddings.parquet`.
+
+Sampling is local because `ebnerd_large`'s `behaviors.parquet` is 24.6M rows
+/ 7.8GB — nothing that size is going to Kaggle. Where
+`reranker_eval_{split}.parquet` already exists, the notebook asserts its own
+population is identical to it impression-for-impression, so Q3's numbers can
+be quoted in the same table as Q2's.
+
+## Reproduce and beat the NRMS baseline (Assignment 2, Q3 — run on Kaggle)
+
+1. Upload everything in `data/kaggle_nrms/` as one private Kaggle Dataset
+   (Kaggle → New Notebook → **+ Add Data → Upload → New Dataset**). Attaching
+   only one dataset's files scopes the run to that dataset — the notebook
+   auto-discovers whichever `nrms_*_train.parquet` files are present.
+2. Import [`src/nrms_baseline_kaggle.ipynb`](src/nrms_baseline_kaggle.ipynb)
+   (File → Import Notebook).
+3. Settings: **Accelerator → GPU** (T4 x2 or P100), **Internet → On** — it
+   clones `ebanalyse/ebnerd-benchmark` at a pinned commit and installs
+   `tf-keras`.
+4. **Save Version → Save & Run All (Commit)**, then download from the
+   Output tab:
+   - `nrms_metrics_{dataset}.json` → `data/processed/{dataset}/`
+   - `nrms_{variant}_{dataset}.weights.h5` → `data/processed/{dataset}/`
+   - `nrms_ablation.png`, `nrms_paired_ci.png` → repo root (design-note figures)
+
+The notebook does all four parts of Q3: it reproduces `NRMSDocVec` from the
+authors' own unmodified code (asserting the clone is at the pinned commit
+with a clean working tree), adds one principled change — a recency prior on
+the user encoder's history attention, elapsed-time on EB-NeRD and ordinal on
+MIND, reusing A2 Q1's weight definitions — runs a three-variant ablation that
+separates that recency signal from the padding mask it also introduces, and
+reports a paired bootstrap 95% CI on every claimed difference over identical
+impressions. Training and scoring are in the same notebook because the
+ablation and the paired CI both need the three variants scored on one common
+population; the trained weights are still downloaded, so local scoring stays
+possible without re-fitting.
+
+Runtime is dominated by three fits per dataset. The notebook prints per-epoch
+and per-variant timings; if a session cannot finish both datasets inside
+Kaggle's GPU limit, attach one dataset at a time, or raise
+`BATCH_SIZE_TRAIN` (32, ebrec's own default) and lower `EPOCHS`.
+
+### Verifying this section's numeric claims
+
+Q3's evaluation population is A2 Q2's, impression for impression
+(`SPEC.md` A2 Q3 §5) — compares the staged files against
+`reranker_eval_{split}.parquet` element by element, and checks
+train/val/test disjointness:
+
+```bash
+uv run python benchmarks/verify_a2q3_claims.py population
+```
+
+Staged-input properties (§5–§6: history truncated to 20, mean candidates per
+impression ~11.9 on `ebnerd_large` and ~37 on `mind_large` — the factor of
+news-encoder work the scoring shortcut removes — cold-start counts, upload
+size):
+
+```bash
+uv run python benchmarks/verify_a2q3_claims.py inputs
+```
+
+The nDCG case the notebook pins its implementation to (§7: six positives at
+ranks 1–5 and 7 of eight candidates give nDCG@5 = 1.000 and
+nDCG@10 = 0.993077), checked against a hand-computed value as well as
+against `evaluation.py`:
+
+```bash
+uv run python benchmarks/verify_a2q3_claims.py ndcg
+```
+
+Recency-weight basis per dataset (§3: `elapsed_time` for `ebnerd_large`,
+`ordinal_proxy` for `mind_large`), decided by null count and showing what a
+dtype-based test would have concluded instead:
+
+```bash
+uv run python benchmarks/verify_a2q3_claims.py recency
+```
+
+The Kaggle notebook restates `evaluation.py`'s estimators because Kaggle has
+no access to the package, and they must stay identical or Q3's numbers are
+not comparable to A1's and A2 Q2's (§7). This parses both and compares the
+function bodies statement by statement:
+
+```bash
+uv run python benchmarks/verify_a2q3_claims.py metric-parity
+```
+
+All of them at once:
+
+```bash
+uv run python benchmarks/verify_a2q3_claims.py all
+```
+
 ## Dataset location
 
 Raw datasets are gitignored and must be placed at the repo root before running anything,
