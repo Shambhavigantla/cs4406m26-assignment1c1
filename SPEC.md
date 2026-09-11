@@ -2633,7 +2633,101 @@ design note quotes the interval rather than the point estimate.
 
 ## 9. Results
 
-Written by the notebook to `nrms_metrics_{dataset}.json` (per variant × split
-× metric with bootstrap CIs, plus the three paired comparisons) and plotted to
-`nrms_ablation.png` / `nrms_paired_ci.png`. Not transcribed here until the
-Kaggle run has produced them.
+Run on Kaggle (GPU T4 x2), three variants per dataset, every variant scored on
+the same 200,000 impressions per split. All three carry **1,304,720
+parameters** on both datasets, asserted at runtime, so nothing below is a
+capacity difference. Per-impression AUC:
+
+| dataset | split | baseline | masked_uniform | recency |
+|---|---|---|---|---|
+| `ebnerd_large` | val | 0.5701 | 0.5773 | 0.5757 |
+| `ebnerd_large` | test | 0.5835 | 0.5836 | **0.5845** |
+| `mind_large` | val | 0.6316 | 0.6323 | **0.6396** |
+| `mind_large` | test | 0.6307 | 0.6261 | **0.6349** |
+
+### The improvement holds on MIND and does not hold on EB-NeRD's test split
+
+Paired bootstrap 95% CI on `recency - baseline`, 1,000 iterations, identical
+impressions on both sides:
+
+| dataset | split | Δ AUC | Δ MRR | Δ nDCG@5 | Δ nDCG@10 |
+|---|---|---|---|---|---|
+| `mind_large` | val | **+0.0080** [+0.0071, +0.0090] | **+0.0109** | **+0.0090** | **+0.0083** |
+| `mind_large` | test | **+0.0042** [+0.0033, +0.0051] | **+0.0087** | **+0.0084** | **+0.0070** |
+| `ebnerd_large` | val | **+0.0056** [+0.0046, +0.0066] | **+0.0032** | **+0.0033** | **+0.0032** |
+| `ebnerd_large` | test | +0.0011 [−0.0000, +0.0021] | **−0.0021** | −0.0001 | **−0.0013** |
+
+Bold marks an interval that excludes zero. On `mind_large` all eight
+intervals exclude zero and all are positive: the improvement is confirmed on
+both splits, on every metric. On `ebnerd_large` the val split agrees, but the
+**test split does not**: AUC and nDCG@5 are indistinguishable from zero, and
+MRR and nDCG@10 are significantly *negative*. The honest statement is that
+this improvement is confirmed on one of the two datasets, and the assignment's
+"CI excludes zero" bar is met for MIND (both splits) and for EB-NeRD's val
+split only.
+
+### What the three-variant ablation attributes the gain to
+
+This is why the middle variant exists. Isolating the recency signal from the
+padding mask (`recency - masked_uniform`):
+
+| dataset | split | Δ AUC | verdict |
+|---|---|---|---|
+| `mind_large` | val | **+0.0073** [+0.0064, +0.0083] | recency signal carries it |
+| `mind_large` | test | **+0.0088** [+0.0078, +0.0097] | recency signal carries it |
+| `ebnerd_large` | val | **−0.0016** [−0.0025, −0.0008] | recency *subtracts*; the mask carries it |
+| `ebnerd_large` | test | +0.0010 [−0.0003, +0.0021] | indistinguishable |
+
+And the mask alone (`masked_uniform - baseline`): `mind_large` +0.0007 (ns) on
+val, **−0.0046** on test; `ebnerd_large` **+0.0072** on val, +0.0001 (ns) on
+test. So the two datasets attribute the same headline change to opposite
+causes:
+
+- On **MIND**, masking the padded history slots does nothing or slightly hurts,
+  and the ordinal recency prior is the entire effect.
+- On **EB-NeRD**, the val-split gain is the padding mask (+0.0072), with the
+  elapsed-time recency prior removing 0.0016 of it. A two-variant experiment
+  would have reported "+0.0056, CI excludes zero, improvement confirmed" here
+  and attributed it to recency, which the decomposition shows is wrong.
+
+Point estimates decompose exactly (means are linear over the same
+impressions), asserted by `test_payloads`: e.g. `ebnerd_large` val
++0.0072 + (−0.0016) = +0.0056.
+
+### A methodological artifact that weakens the EB-NeRD result specifically
+
+`split_by_last_day` reproduces `ebnerd_nrms_docvec.py`'s own rule (fit on
+everything before the training sample's last calendar day, monitor on that
+day). That rule interacts badly with A1's EB-NeRD cutoff. EB-NeRD's train
+split ends at **07:00**, so its last calendar day holds only 7 hours of
+impressions; MIND's ends at **midnight**, so its last day is a full one:
+
+| dataset | early-stopping samples | share of training sample |
+|---|---|---|
+| `ebnerd_large` | 15,056 | **3.8%** |
+| `mind_large` | 152,891 | 25.4% |
+
+Epoch selection visibly mattered on EB-NeRD and not on MIND. EB-NeRD's
+grouped val AUC *declines* after the first or second epoch
+(`masked_uniform` 0.6722 → 0.6519 → 0.6409), so `restore_best_weights` picked
+epoch 2 for the baseline and epoch 1 for both variants — three models stopped
+at different points on the basis of a 15,056-sample signal. MIND's rises
+monotonically and all three variants ran the full three epochs. The EB-NeRD
+val/test disagreement above is therefore consistent with a noisy epoch
+choice rather than with a property of the model, and that possibility cannot
+be separated from the data with this run alone.
+
+The fix, if this is revisited, is to carve the early-stopping set by a time
+*quantile* of the training sample rather than by calendar day — the
+`split_by_last_day` fallback already implements a chronological 90/10 cut and
+currently only triggers when the calendar-day rule degenerates entirely. That
+would make the two datasets' early-stopping sets comparable in size, at the
+cost of departing from the authors' exact protocol.
+
+### Cost
+
+Per variant, on one GPU session: `ebnerd_large` ~374-382s to fit and ~155s to
+score both splits; `mind_large` ~480-502s to fit and ~170s to score. Six fits
+and twelve scoring passes fit comfortably inside one session, which is what
+the user-vector-per-impression scoring path (#6) buys — the authors'
+per-candidate path would have multiplied the scoring half by ~11.9 and ~37.

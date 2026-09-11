@@ -1026,3 +1026,36 @@ fixture. `benchmarks/verify_a2q3_claims.py` covers the section's claims,
 including a `metric-parity` check that parses both the notebook and
 `evaluation.py` and compares the restated estimators statement by
 statement.
+
+### "[Kaggle run completed] @src/nrms_Q3_executed.ipynb @nrms_ablation.png @nrms_paired_ci.png ... also, added the h5 files in data/processed/{dataset}"
+
+The Q3 run came back and the headline is split by dataset, which is the
+finding rather than a disappointment. On `mind_large` the improvement is
+confirmed: all four metrics on both splits give a paired 95% interval that
+excludes zero and is positive (AUC +0.0080 val, +0.0042 test). On
+`ebnerd_large` it is not: val agrees (+0.0056) but test does not, with AUC
+and nDCG@5 indistinguishable from zero and MRR and nDCG@10 significantly
+negative. Written up as such in SPEC.md A2 Q3 section 9 and the design note,
+because the assignment's bar is a CI that excludes zero and hiding half the
+answer would not meet it.
+
+**The three-arm ablation paid for itself.** Isolating the recency signal from
+the padding mask the same layer introduces, the two datasets attribute the
+identical headline change to opposite causes: on MIND the mask does nothing
+(val) or hurts (test) and the ordinal recency prior is the entire effect; on
+EB-NeRD the val gain *is* the mask (+0.0072) and the elapsed-time recency
+prior removes 0.0016 of it. A two-variant experiment would have reported
+EB-NeRD's val result as a confirmed recency improvement and been wrong about
+the mechanism.
+
+**A methodological artifact found while reading the training logs, not
+guessed.** EB-NeRD's early-stopping set is 15,056 samples (3.8% of training)
+against MIND's 152,891 (25.4%), and EB-NeRD's grouped val AUC *declines*
+after epoch 1-2 so `restore_best_weights` stopped the three variants at
+different epochs on the strength of that small signal. Cause confirmed
+directly against the staged train file's day counts: A1's EB-NeRD train split
+ends at 07:00, so `split_by_last_day` -- faithfully copied from
+`ebnerd_nrms_docvec.py` -- gets only 7 hours of impressions (14,992 of
+400,000), while MIND's midnight cutoff gives it a full day (100,495). This is
+a live alternative explanation for the EB-NeRD val/test disagreement and is
+documented as one rather than asserted away.

@@ -128,11 +128,51 @@ architecture fed all-zero log-weights --- sits between them, and the two paired
 intervals separate the mask from the signal. The three point estimates
 decompose exactly, which the notebook asserts.
 
-\todo{The measured table: AUC/MRR/nDCG@5/nDCG@10 per variant per split per
-dataset with bootstrap CIs, the three paired 95\% CIs and which of them exclude
-zero, and where NRMS lands against A2 Q2's Stage-1 baselines and re-ranker on
-the same 200,000 impressions. Figures: \code{nrms\_ablation.png},
-\code{nrms\_paired\_ci.png}.}
+The result splits by dataset, and the three-arm ablation is what makes that
+readable. Every variant carries an identical 1,304,720 parameters, so none of
+what follows is capacity.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llccc}
+\toprule
+dataset & split & baseline & masked\_uniform & recency \\
+\midrule
+\code{ebnerd\_large} & val  & 0.5701 & 0.5773 & 0.5757 \\
+\code{ebnerd\_large} & test & 0.5835 & 0.5836 & 0.5845 \\
+\code{mind\_large}   & val  & 0.6316 & 0.6323 & \textbf{0.6396} \\
+\code{mind\_large}   & test & 0.6307 & 0.6261 & \textbf{0.6349} \\
+\bottomrule
+\end{tabular}
+\caption{Per-impression AUC, 200,000 impressions per split, identical
+impressions across variants.}
+\end{table}
+
+On MIND the improvement is confirmed: all four metrics on both splits give a
+paired 95\% interval excluding zero and positive, $\Delta$AUC $+0.0080$
+$[+0.0071, +0.0090]$ on val and $+0.0042$ $[+0.0033, +0.0051]$ on test. On
+EB-NeRD it is not: val agrees ($+0.0056$ $[+0.0046, +0.0066]$) but test does
+not, with AUC and nDCG@5 indistinguishable from zero and MRR and nDCG@10
+significantly negative. Reported as such --- the assignment's bar is met for
+MIND on both splits and for EB-NeRD on val only.
+
+What the middle variant buys is the reason why. Isolating recency from the
+padding mask it also introduces, the two datasets attribute the same headline
+change to opposite causes: on MIND masking does nothing (val) or hurts (test)
+and the ordinal recency prior is the whole effect ($+0.0073$ and $+0.0088$);
+on EB-NeRD the val gain \emph{is} the mask ($+0.0072$) and the elapsed-time
+recency prior removes $0.0016$ of it. A two-arm experiment would have reported
+EB-NeRD's val result as a confirmed recency improvement, and been wrong about
+the mechanism.
+
+\todo{Two things still to write here: where these numbers sit against A2 Q2's
+Stage-1 baselines and re-ranker (they were measured on the same 200,000
+impressions, so the tables are directly comparable), and the early-stopping
+artifact from SPEC.md A2 Q3 \S9 --- EB-NeRD's 07:00 split cutoff leaves the
+authors' last-calendar-day rule only 3.8\% of the training sample to monitor
+on, against MIND's 25.4\%, which is a live alternative explanation for the
+EB-NeRD val/test disagreement and should be stated as one. Figures:
+\code{nrms\_ablation.png}, \code{nrms\_paired\_ci.png}.}
 
 \subsection{Serving and Scale Analysis (Q4)}
 \label{sec:serving}
