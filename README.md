@@ -708,7 +708,7 @@ uv run python benchmarks/verify_a2q3_claims.py inputs
 
 The nDCG case the notebook pins its implementation to (§7: six positives at
 ranks 1–5 and 7 of eight candidates give nDCG@5 = 1.000 and
-nDCG@10 = 0.993077), checked against a hand-computed value as well as
+nDCG@10 = 0.993078), checked against a hand-computed value as well as
 against `evaluation.py`:
 
 ```bash

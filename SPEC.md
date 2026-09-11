@@ -2597,7 +2597,7 @@ the repo, and must stay identical — A1 and A2 Q2's numbers came from them.
 tie-handling details that are silently wrong if changed (average ranks for
 AUC ties, stable argsort elsewhere) and the case where nDCG@10 falls *below*
 nDCG@5 (A2 Q2 §11): six positives at ranks 1–5 and 7 of eight candidates give
-nDCG@5 = 1.000 against nDCG@10 = 0.993077. It also reproduces A2 Q2 §8's
+nDCG@5 = 1.000 against nDCG@10 = 0.993078. It also reproduces A2 Q2 §8's
 paired-CI checks (covers a known +0.02 effect, excludes zero, ≥4× tighter than
 the unpaired interval on the same data, chunked equals unchunked at a fixed
 seed) and cross-checks the mean AUC against ebrec's own `AucScore` when their

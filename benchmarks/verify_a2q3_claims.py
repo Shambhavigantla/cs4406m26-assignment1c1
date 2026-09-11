@@ -44,7 +44,7 @@ HALF_LIFE_CLICKS = 5.0
 # news-encoder work the shortcut removes.
 CLAIMED_CANDIDATES = {"ebnerd_large": 11.9, "mind_large": 37.0}
 # SPEC.md A2 Q3 #7
-CLAIMED_NDCG10 = 0.993077
+CLAIMED_NDCG10 = 0.993078
 
 # The functions the Kaggle notebook restates from evaluation.py because
 # Kaggle has no access to the package (SPEC.md A2 Q3 #7).
@@ -165,7 +165,7 @@ def check_inputs() -> None:
 def check_ndcg() -> None:
     """SPEC.md A2 Q3 #7: the constructed case the notebook pins its nDCG
     implementation to -- six positives at ranks 1-5 and 7 of eight
-    candidates give nDCG@5 = 1.000 and nDCG@10 = 0.993077."""
+    candidates give nDCG@5 = 1.000 and nDCG@10 = 0.993078."""
     print("== nDCG@10 below nDCG@5, exact value ==")
     scores = np.array([8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0])
     labels = np.array([1, 1, 1, 1, 1, 0, 1, 0], dtype=bool)
