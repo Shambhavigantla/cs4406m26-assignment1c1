@@ -25,7 +25,9 @@
     \colorbox{gray!40}{\texttt{#1}}%
 }
 
-\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+% A colour switch inside a group, not \textcolor{..}{#1}: \textcolor's argument
+% is not \long, so a placeholder spanning paragraphs would fail to compile.
+\newcommand{\todo}[1]{{\color{red}[TODO: #1]}}
 
 \title{IRE Assignment 2 Design Note\\\large Learning from Click-Logs on EB-NeRD and MIND}
 \author{Iman Kalyan Chakraborty - 2026801003}
@@ -177,9 +179,42 @@ EB-NeRD val/test disagreement and should be stated as one. Figures:
 \subsection{Serving and Scale Analysis (Q4)}
 \label{sec:serving}
 
-\todo{Index memory, p99 latency for candidate generation plus feature assembly
-plus re-ranker scoring, and a back-of-envelope cost per 1000 queries at a target
-SLA.}
+% ---------------------------------------------------------------------
+% MEASURED (SPEC.md A2 Q4, data/processed/{dataset}/serving_metrics.json).
+% Numbers below are from the final run on this machine (i5-13500, 15.7 GB).
+% Write this section around the three findings; do not re-derive them.
+% ---------------------------------------------------------------------
+\todo{Write out from SPEC.md A2 Q4. Served two-stage path (BM25 + embedding
+over the in-view set, LightGBM re-rank), 1,000 sampled requests after 50
+warm-up: p99 \textbf{6.09 ms} on \code{ebnerd\_large}, \textbf{10.43 ms} on
+\code{mind\_large}, against a 100 ms SLA (16$\times$ / 9.6$\times$ headroom);
+230 / 161 QPS per process; \$0.000051 / \$0.000073 per 1,000 queries at
+\$0.0425/vCPU-h (stated assumption). Resident serving set 0.80 / 0.68 GB, of
+which the embedding matrix and its unit copy are $\sim$90\%; BM25 index 84 / 85
+MB; booster 374 / 320 KB.
+
+Three findings to carry: (1) \code{bm25\_inview} is 83\% / 88\% of the served
+path because the inverted index scores the whole catalogue to read out a
+dozen documents --- the index choice that made A1's candidate generation fast
+is the one thing holding the served path above a millisecond; a forward index
+would fix it. (2) The offline feature table already exceeds this machine at
+1$\times$ on \code{ebnerd\_large} (27.9 GB vs 15.7 GB) and at 2$\times$ on MIND
+--- the measured form of every memory incident in the project, and why Q1/Q2
+stream it. State clearly that this is the offline artifact; a live system
+derives features from history + article metadata, so the timed
+\code{feature\_assembly} (a slice) is a \emph{lower bound}. (3) Calling A1's
+offline \code{batched\_top\_k} per request re-normalizes the corpus each call:
+40$\times$ slower than the serving-shaped matvec, 311 / 274 ms p99, which would
+have shown an SLA breach at 1$\times$ --- measured deliberately as the cost of
+reusing an offline function for serving.
+
+Order of breakage at 10$\times$: feature table (279 / 101 GB) first and already;
+brute-force embedding retrieval second (serving set 8.0 / 6.8 GB, top-200 p99
+81 / 69 ms --- an ANN index becomes a requirement); BM25 corpus-wide top-K third
+and it breaches on MIND (146 ms p99; 37 postings/doc vs EB-NeRD's 22 --- WAND/BMW
+or sharding). The re-ranker does not scale with anything and is the cheapest
+stage in the system. Figure: \code{serving\_benchmark.png} (three panels: served-path
+breakdown, candidate-generation p99 against the SLA, resident memory vs this machine).}
 
 \subsection{Code Optimizations}
 \label{sec:optimizations}

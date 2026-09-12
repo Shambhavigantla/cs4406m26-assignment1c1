@@ -2731,3 +2731,247 @@ score both splits; `mind_large` ~480-502s to fit and ~170s to score. Six fits
 and twelve scoring passes fit comfortably inside one session, which is what
 the user-vector-per-impression scoring path (#6) buys — the authors'
 per-candidate path would have multiplied the scoring half by ~11.9 and ~37.
+
+# A2 Q4 — Serving & Scale Analysis
+
+## 1. What is measured, and on what
+
+The **served two-stage pipeline** of A2 Q1/Q2: BM25 and frozen-embedding
+retrieval scoring each impression's `article_ids_inview`, feeding the LightGBM
+re-ranker. That is the path A2 Q2 evaluated and Q5 submits. Q3's NRMS is a
+baseline for comparison, not the served system, and is not timed; serving it
+locally would need its Keras weights plus a runtime this environment does not
+have (`tensorflow-cpu` publishes no `cp314` wheels).
+
+Q4 is a single-machine measurement by construction — index memory, p99
+latency and a cost/QPS figure only compose into an argument if they describe
+the same host — so `src/serving_benchmark.ipynb` captures the machine
+specification into its output rather than assuming it:
+
+| | |
+|---|---|
+| host | Windows-11-10.0.26200-SP0 |
+| CPU | 13th Gen Intel Core i5-13500 — 20 logical cores |
+| RAM | 15.7 GB |
+| stack | Python 3.14.6, numpy 2.5.1, polars 1.43.2, lightgbm 4.7.0 |
+
+This is the same machine whose `WinError 10055` and
+`STATUS_FATAL_MEMORY_EXHAUSTION` incidents A1 Q4 §9 and A2 Q1 §8 document, so
+§5's 10× argument continues a measured history rather than opening a
+hypothetical one.
+
+Wrapper: `serving_benchmark.py`; `SERVING_DATASETS` scopes a run to one
+dataset per kernel. Output: `data/processed/{dataset}/serving_metrics.json`.
+`benchmarks/verify_a2q4_claims.py` prints every figure quoted below from
+those files and re-asserts the consistency they rely on.
+
+## 2. Index memory: byte-accounted, not estimated
+
+`sys.getsizeof` on a dict returns the hash table only — not keys, values, or
+the numpy buffers the values point at, which for `BM25Index.postings` is
+essentially all of it. `deep_nbytes` walks containers and adds `.nbytes` for
+arrays, and de-duplicates shared buffers through a `_seen` set: a view is
+redirected to its `.base`, and without de-duplication `embedding_lookup`'s
+125,541 views into one block would be reported as
+125,541 copies of the matrix. Both properties are
+asserted on probe objects before any real structure is measured.
+
+The feature table is measured on a 200,000-row slice and extrapolated.
+Reading `reranker_features.parquet` whole to measure it would reproduce the
+memory exhaustion this section characterises.
+
+| dataset | BM25 index | embedding matrix (+ unit copy) | LightGBM | **resident serving set** | feature table on disk | feature table if resident |
+|---|---|---|---|---|---|---|
+| `ebnerd_large` | 83.8 MB (2,719,463 postings) | 367.8 MB × 2 | 374 KB (53 trees) | **0.80 GB** | 9.56 GB | 190,850,352 rows × 157 B = **27.90 GB** |
+| `mind_large` | 85.2 MB (3,864,307 postings) | 305.1 MB × 2 | 320 KB (45 trees) | **0.68 GB** | 4.00 GB | 97,592,931 rows × 111 B = **10.11 GB** |
+
+Two things the table settles. The **resident serving set is under a
+gigabyte** on both datasets, and 90% / 88% of it is the
+embedding matrix and its unit-normalized copy — the BM25 index and the booster
+are rounding error beside it. And the **offline feature table does not fit in
+this machine's RAM even at 1× on `ebnerd_large`**: 27.9 GB against
+15.7 GB. That is not a projection; it is why A2 Q1 and Q2 had to be
+built as streaming, chunked passes, and it is the measured form of the
+incidents cited above.
+
+## 3. Latency: every stage of one request, separately and end to end
+
+`LATENCY_REPS = 1000` sampled requests from A2 Q2's scored test population,
+after `WARMUP_REPS = 50` untimed requests absorb BLAS thread-pool spin-up and
+page-in. The 99th percentile of 1,000 samples is the 10th-largest value — an
+order statistic with real support, not a single outlier.
+
+Excluded from every per-request figure: index construction, embedding
+normalization and the feature-store load. They are startup costs, reported
+in §2; charging them to a request would report a latency no served system
+has.
+
+Stage 1's fresh `bm25_score` and `embedding_score` overwrite the persisted
+columns before the booster runs, because at serving time those two features
+are computed, not read.
+
+| stage (mean / p99, ms) | `ebnerd_large` | `mind_large` |
+|---|---|---|
+| `query_build` | 0.17 / 0.23 | 0.16 / 0.26 |
+| `bm25_inview` | 3.64 / 5.24 | 5.44 / 9.48 |
+| `embedding_inview` | 0.06 / 0.11 | 0.09 / 0.26 |
+| `feature_assembly` | 0.16 / 0.23 | 0.17 / 0.27 |
+| `reranker_predict` | 0.34 / 0.41 | 0.34 / 0.42 |
+| **`served_end_to_end`** | **4.36 / 6.09** | **6.20 / 10.43** |
+| `candgen_bm25_top200` | 4.72 / 9.06 | 6.81 / 14.56 |
+| `candgen_embedding_top200` | 7.34 / 8.12 | 6.10 / 6.89 |
+| `candgen_embedding_top200_batchfn` | 291.09 / 310.90 | 241.39 / 274.35 |
+| candidates per request (mean / max) | 11.9 / 73 | 34.0 / 254 |
+
+### The served path meets a 100 ms p99 with an order of magnitude to spare
+
+p99 of **6.09 ms** on `ebnerd_large` and
+**10.43 ms** on `mind_large`. The difference
+between the two is almost entirely candidate count (11.9 vs
+34.0 per request) acting on the BM25 stage.
+
+### BM25 in-view scoring is the served path
+
+`bm25_inview` is **83%** of the served mean on `ebnerd_large` and
+**88%** on `mind_large`, for a stage whose output is ~12–34 numbers.
+The reason is structural: `get_scores` is an inverted-index traversal that
+allocates an `n_docs`-length array and accumulates every posting of every
+query term — it scores the whole catalogue, and the in-view subset is then
+read out of that. That is the right shape for corpus-wide top-K (§3's
+`candgen_bm25_top200` costs barely more than `bm25_inview`, which is the
+proof) and the wrong shape for re-scoring a dozen known documents, which a
+**forward index** (document → term frequencies) would do in microseconds.
+The index choice that made A1's candidate generation fast is the one thing
+holding the served path above a millisecond. Everything else — query build,
+embedding cosine over the subset, feature gathering, and 45–53 trees of
+LightGBM — sums to well under a millisecond.
+
+### Two candidate paths, because Q4's wording and the served system differ
+
+Q4 asks for "candidate generation + re-ranking". The served path scores the
+in-view set (A1 Q4 §1 records why: Codabench requires a permutation of it,
+and recall@200 caps any corpus-wide pipeline at 0.2–3%). Corpus-wide top-200
+retrieval is what "candidate generation" names, so it is measured too. The
+embedding version is measured **twice**, and the gap between the two rows is
+a finding about API shape rather than about the model:
+
+- `candgen_embedding_top200` — serving-shaped. The unit corpus is precomputed
+  once (it is the "+ unit copy" in §2) and a request is one matvec plus
+  `argpartition`. 8.1 / 6.9 ms p99.
+- `candgen_embedding_top200_batchfn` — `embeddings.batched_top_k` called per
+  request. That function normalizes the whole corpus **inside every call**,
+  because it amortizes the cost over 2,000 queries in A1 Q3's offline pass.
+  Per request it re-normalizes `n_docs × 768` floats for one query:
+  **40× / 40×** slower, at
+  311 / 274 ms p99 — which would have
+  shown the system **breaching the SLA at 1×** had the offline function been
+  reused as the serving function. It is measured deliberately, so the design
+  note can state the cost of that mistake rather than assert it.
+
+## 4. Cost and QPS at the SLA
+
+Throughput is derived from the **mean** service time and the SLA check from
+the **p99**: a queue's service rate is set by the mean, while the tail is what
+breaches. Using p99 for both would understate capacity by the width of the
+tail.
+
+Stated assumptions, recorded in the output beside the figures they produce:
+one request occupies one process; processes scale linearly across vCPUs; and
+a price of `$0.0425` per vCPU-hour. The first two are optimistic — numpy's
+BLAS may already use several threads inside one request, so a "process" is
+not cleanly one core, and real deployments lose headroom to queueing well
+before full utilisation.
+
+The price is a plug-in, and its provenance should be read as such: it is
+approximately the AWS `c5.large` on-demand rate in `us-east-1` (~$0.085/h for
+2 vCPUs), taken from general knowledge rather than a quoted price sheet, and
+not re-verified for this write-up — cloud list prices change and vary by
+region, and a reserved or spot rate would be several times lower. It was
+chosen because it is a round, recognisable compute-optimised figure, not
+because it is authoritative. What makes the conclusion robust is that cost
+scales *linearly* with this one number while the measured CPU-seconds do not
+move: at any list price between `$0.02` and `$0.10` per vCPU-hour, a thousand
+queries still cost between two and twenty thousandths of a cent. The
+measured quantity is `cpu_seconds_per_1000_queries`, which is what the JSON
+carries; the dollar figure is that number times whichever price the reader
+prefers. This is a back-of-envelope, which is what the assignment asks for.
+
+| dataset | served mean (ms) | served p99 (ms) | p99 < 100 ms | QPS / process | processes for 1,000 QPS | USD / 1,000 queries |
+|---|---|---|---|---|---|---|
+| `ebnerd_large` | 4.36 | 6.09 | meets (16.42×) | 230 | 5 | $0.000051 |
+| `mind_large` | 6.20 | 10.43 | meets (9.59×) | 161 | 7 | $0.000073 |
+
+At these service times the re-ranking stage is not where money goes. A
+thousand queries cost a fraction of a cent of CPU, and a single mid-range
+desktop sustains the order of a thousand QPS. Cost at this scale is dominated
+by keeping the serving set and — far more — the feature pipeline resident,
+which is §5's subject.
+
+## 5. What breaks first at 10×
+
+Arithmetic on §2's measured footprints, with each component labelled by how
+it actually scales — because that is what decides the answer:
+
+- the embedding matrix and its normalized copy scale **linearly with the
+  catalogue**, and both must be resident for brute-force cosine;
+- BM25 postings scale with catalogue × mean document length — also linear;
+- the feature table scales with **impressions × candidates**, the term that
+  grows fastest under "10× the load": 10× traffic is 10× the table even over
+  an unchanged catalogue;
+- the re-ranker scales with **neither** — a fixed 53–45 trees — which is why
+  it never appears in the answer.
+
+Latency projections multiply §3's serving-shaped candidate-generation p99s:
+brute-force cosine is O(n_docs × dim) per query, and the inverted-index
+traversal is O(postings touched), both linear in the catalogue.
+
+| dataset | scale | serving set (GB) | feature table (GB) | both fit in 15.7 GB | BM25 top-200 p99 (ms) | embedding top-200 p99 (ms) |
+|---|---|---|---|---|---|---|
+| `ebnerd_large` | 1× | 0.8 | 27.9 | **no** | 9.1 | 8.1 |
+| `ebnerd_large` | 2× | 1.6 | 55.8 | **no** | 18.1 | 16.2 |
+| `ebnerd_large` | 5× | 4.0 | 139.51 | **no** | 45.3 | 40.6 |
+| `ebnerd_large` | 10× | 8.0 | 279.02 | **no** | 90.6 | 81.2 |
+| `mind_large` | 1× | 0.68 | 10.11 | yes | 14.6 | 6.9 |
+| `mind_large` | 2× | 1.36 | 20.21 | **no** | 29.1 | 13.8 |
+| `mind_large` | 5× | 3.4 | 50.54 | **no** | 72.8 | 34.5 |
+| `mind_large` | 10× | 6.79 | 101.07 | **no** | 145.6 | 68.9 |
+
+### The order in which things break
+
+**First, and already: the offline feature table.** It exceeds this machine
+at 1× on `ebnerd_large` (27.9 GB) and at 2× on `mind_large`
+(20.21 GB). This is the measured form of every memory incident
+in this project's history. The mitigation is also already built — every pass
+over it streams in `CHUNK_SIZE` slices with atomic checkpoints — but the 10×
+figures (279 / 101 GB) say that streaming from local
+disk stops being a strategy and becomes a distributed feature store or a
+recomputation-on-demand design. The distinction matters for serving: the
+table measured here is the **offline** training/evaluation artifact. A live
+system does not look these features up for a new impression; it derives them
+from the user's history and the article metadata, both of which are in the
+resident serving set. The `feature_assembly` stage timed in §3 is therefore a
+**lower bound** on serving-time feature cost — it measures gathering
+precomputed rows, not computing the eleven behavioural features from history
+— and that gap is the largest thing this benchmark does not measure.
+
+**Second, at roughly 10×: brute-force embedding retrieval.** The serving set
+grows to 8.0 / 6.8 GB — half this machine — and the
+embedding top-200 p99 reaches 81 / 69 ms,
+still inside the 100 ms SLA on its own but with none left for the rest of the
+request. This is the point at which an approximate index (HNSW or IVF-PQ)
+stops being an optimisation and becomes a requirement, trading the exactness
+that A1's `batched_top_k` verified against a full sort for a sub-linear query.
+
+**Third, and it breaches: BM25 corpus-wide top-K.** At 10× the projected p99
+is 91 ms on `ebnerd_large` and **146 ms on `mind_large`** — the
+latter over the SLA before re-ranking has run. MIND's longer documents give
+it 37 postings per document against EB-NeRD's
+22, so its traversal is longer per query at every scale. The
+standard remedies — impact-ordered postings with early termination
+(WAND/BMW), or a sharded index — are the same ones that would also fix §3's
+in-view finding, since both stem from scoring the whole catalogue to read out
+a few hundred documents.
+
+**What does not break: the re-ranker.** 374 KB,
+0.41 ms p99, and neither figure moves with catalogue or
+traffic. The stage that A2 added is the cheapest one in the system.

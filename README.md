@@ -738,6 +738,43 @@ All of them at once:
 uv run python benchmarks/verify_a2q3_claims.py all
 ```
 
+## Serving and scale benchmark (Assignment 2, Q4)
+
+```bash
+SERVING_DATASETS=ebnerd_large uv run python serving_benchmark.py
+SERVING_DATASETS=mind_large uv run python serving_benchmark.py
+```
+
+(PowerShell: `$env:SERVING_DATASETS = "ebnerd_large"; uv run python serving_benchmark.py`)
+
+Executes [`src/serving_benchmark.ipynb`](src/serving_benchmark.ipynb) and
+writes `data/processed/{dataset}/serving_metrics.json` plus
+`serving_benchmark.png`. Measures the **served two-stage pipeline** (BM25 and
+embedding retrieval over each impression's in-view set, feeding the LightGBM
+re-ranker) on this machine: byte-accounted index memory, per-stage and
+end-to-end p99 latency over 1,000 sampled single requests, a back-of-envelope
+cost per 1,000 queries at a p99 < 100 ms SLA, and a 10x scaling projection.
+The machine specification is captured into the output, because Q4's three
+numbers only compose if they describe one host. Requires A1's feature store,
+A1 Q3's `article_embeddings.parquet`, and A2 Q2's `reranker_model_{dataset}.txt`
+and `reranker_eval_test.parquet`. See `SPEC.md`'s `A2 Q4` section.
+
+The figure needs `matplotlib`, which is not a project dependency; without it
+the benchmark runs to completion and skips only the plot.
+
+### Verifying this section's numeric claims
+
+Every number quoted in `SPEC.md` A2 Q4 is read from `serving_metrics.json`;
+re-running the command above regenerates all of them on the current machine,
+and the notebook's own test cells assert the internal consistency the spec
+relies on (percentiles ordered, end-to-end reconciles with its stages,
+throughput derived from the mean, the 1x projection equals the measurement).
+To print the headline figures without re-running:
+
+```bash
+uv run python benchmarks/verify_a2q4_claims.py
+```
+
 ## Dataset location
 
 Raw datasets are gitignored and must be placed at the repo root before running anything,
