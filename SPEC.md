@@ -2325,3 +2325,409 @@ candidate-set fork A1's Q4 already had to resolve (Q4 §1) reappearing as a
 feature-level result. They are retained in `FEATURE_COLUMNS` because removing
 them would invalidate the trained boosters' positional column order for no
 measured benefit, but they should be dropped if the models are ever retrained.
+
+# A2 Q3 — Baseline Reproduced, Then Beaten
+
+## 1. Scope and shape
+
+Two notebooks:
+
+- `src/nrms_inputs.ipynb` (wrapper `nrms_inputs.py`, `NRMS_INPUT_DATASETS` to
+  scope a run) — local, builds `data/kaggle_nrms/` from the A1 feature store.
+- `src/nrms_baseline_kaggle.ipynb` — Kaggle, GPU + internet, runs all four
+  parts of Q3 (baseline, improvement, ablation, paired CIs) and writes
+  `nrms_metrics_{dataset}.json`, `nrms_{variant}_{dataset}.weights.h5`,
+  `nrms_ablation.png`, `nrms_paired_ci.png`.
+
+Inference is **not** local (unlike A2 Q2's re-ranker, and unlike the earlier
+plan of a `tf2onnx` export plus local `onnxruntime` scoring). Q3 items 2–4
+each require inference: the ablation needs three trained variants scored on
+one common population, and the paired CI needs their per-impression metric
+arrays aligned index-for-index. Keeping training and scoring in the same
+kernel makes that alignment structural rather than something two separate
+processes have to agree on, and removes the ONNX export from the critical
+path entirely. The trained weights are still downloaded, so local scoring
+remains possible without re-fitting.
+
+Both datasets run through **one** code path: `NRMSDocVec` applied to
+`ebnerd_large` and `mind_large` alike. The alternative — `ebnerd-benchmark`
+for EB-NeRD, `recommenders-team/recommenders`' NRMS-on-MIND for MIND — was
+rejected: it means two model implementations, a GloVe-tokenised title
+pipeline for MIND instead of the document vectors A1 already computed, a
+second dependency stack that expects raw `MINDsmall` files, and MIND numbers
+that are not comparable to EB-NeRD's. The assignment's wording ("e.g. NRMS
+from the ebnerd-benchmark repo, or the MIND baseline") admits either.
+
+## 2. Baseline: the authors' code, pinned and unmodified
+
+`NRMSDocVec` is imported from a clone of
+`github.com/ebanalyse/ebnerd-benchmark` at commit
+`5164e2ce7c92b99cbcb853d5f804cc95f0232b2f`, so "the baseline" names one
+revision. `test_environment` asserts the checked-out HEAD equals that commit,
+that `git status --porcelain` is empty (an unmodified working tree — a
+reproduction, not a rewrite), and that `NRMSDocVec`/`AttLayer2`/`SelfAttention`
+were imported from the clone's path rather than from anything shadowing it.
+
+`hparams_nrms_docvec` keeps its published values (16 heads × 16 dims,
+200-unit attention, `[512, 512, 512]` news encoder, dropout 0.2, Adam 1e-4,
+categorical cross-entropy, `npratio` 4, batch 32); only `title_size` (768,
+asserted against the embedding data) and `history_size` (20) are bound to our
+inputs. Every variant is fitted with the identical hyperparameters.
+
+`NRMSDocVec` consumes precomputed document vectors, which is why it is the
+right baseline here: A1 Q3's `article_embeddings.parquet` is exactly its news
+input, for both datasets, so the reproduction does not need a text encoder or
+a vocabulary and both datasets stay in one vector space.
+
+### Imported from the clone, not `pip install .`
+
+`ebrec` pins `polars==0.20.8`, `numpy<1.26.1`, `torch<2.3` and
+`transformers<4.37.3`. Installing it downgrades Kaggle's stack underneath a
+running kernel (or fails to resolve), for dependencies this notebook does not
+need: `nrms_docvec.py` and `layers.py` import nothing but `tensorflow` and
+`numpy`. `sys.path` is extended to the clone's `src/` instead.
+
+Their **dataloader** is the piece that actually needs the pinned polars —
+`map_list_article_id_to_value` calls `Expr.replace(default=...)`, whose
+`default` argument was removed in polars 1.0 — so batching is reimplemented
+(§5) and checked against their semantics rather than being used from the
+package.
+
+### Legacy Keras is mandatory
+
+`layers.py` is written against the Keras 2 backend API (`K.dot`,
+`K.permute_dimensions`, `K.one_hot`, `K.squeeze`), all removed in Keras 3, so
+under Kaggle's default TF the authors' layers cannot run at all. The setup
+cell sets `TF_USE_LEGACY_KERAS=1` **before** the first `import tensorflow`,
+installs `tf-keras` if absent, and registers `sys.modules["tensorflow.keras"]
+= tf.keras` because `layers.py` does `import tensorflow.keras as keras` and
+that module *path* is a lazy-loader shim whose importability varies by TF
+version. `test_environment` asserts `tf.keras.__version__` starts with `2.`
+and that the five backend functions used exist — without it the failure
+surfaces much later, inside the first model build.
+
+## 3. Improvement: a recency prior on the history attention
+
+`NRMSDocVec` pools history with multi-head self-attention followed by
+additive attention (`AttLayer2`). That pooling is order- and time-blind:
+permuting a user's history leaves the user vector unchanged. The change adds
+one term to the attention exponent,
+
+```
+a_i = exp(q . tanh(W h_i + b) + log w_i)      i.e.  a_i = w_i * exp(logit_i)
+```
+
+so recency multiplies the learned attention instead of replacing it, and
+`log w_i = 0` recovers the authors' layer.
+
+`log w_i = -ln2 * age_i / half_life`, then shifted so each row's maximum is 0
+(exactly invariant, since the weights are renormalised immediately, and it
+keeps `exp` away from underflow). Bases and half-lives are A2 Q1 §3's,
+unchanged, rather than a third notion of recency:
+
+| dataset | `recency_weight_basis` | `age_i` | half-life |
+|---|---|---|---|
+| `ebnerd_large` | `elapsed_time` | `impression_time − timestamp_i`, hours | 72 hours |
+| `mind_large` | `ordinal_proxy` | clicks back from the most recent | 5 clicks |
+
+Weights are per **(impression, click)**, not per user: the history is a fixed
+pre-window snapshot, but a click decays further between a user's first and
+last evaluated impression, and a per-user vector would misprice that.
+**Log**-weights are what the data path produces and the layer consumes;
+weights are never materialised, so EB-NeRD's older clicks cannot underflow.
+
+`RecencyAttLayer2` subclasses `AttLayer2`, overriding `call` (and `build`,
+which forwards the vector branch's shape so the weight shapes and
+initialisers stay the parent's). It **adds no weights**, so all three variants
+have identical parameter counts — asserted, and the reason a measured
+difference cannot be capacity. `NRMSDocVecRecency` subclasses `NRMSDocVec`
+and overrides only `_build_userencoder`/`_build_nrms`; the news encoder, loss,
+optimiser and hyperparameter handling are inherited.
+
+## 4. Ablation: three variants, because the improvement bundles two effects
+
+A padded history slot is a zero document vector, and `AttLayer2` still
+assigns it positive attention (`exp(logit)` of a zero vector is not zero).
+`log w = -1e9` on padded slots removes them exactly — a real fix, but not the
+recency signal. A two-way comparison would credit recency for it.
+
+| variant | log-weights | isolates |
+|---|---|---|
+| `baseline` | (no such input) | the authors' model |
+| `masked_uniform` | 0 on real slots, `-1e9` on padding | padding mask only |
+| `recency` | §3's log-weights | padding mask + recency |
+
+Three paired comparisons per split follow: `baseline_vs_recency` (the headline
+claim), `masked_uniform_vs_recency` (the recency signal alone),
+`baseline_vs_masked_uniform` (the mask alone). The point estimates decompose
+exactly — the first is the sum of the other two, because every term is a mean
+over the same impressions — which `test_payloads` asserts as an internal
+consistency check on the ablation.
+
+`test_recency_layer` carries the load-bearing assertion: with all-zero
+log-weights and the parent's weights copied in, `RecencyAttLayer2` reproduces
+`AttLayer2`'s output **bit for bit** (`np.array_equal`). Hence the same
+`+ K.epsilon()` denominator as the parent rather than a numerically
+"improved" softmax — a max-subtracting stable softmax would make the
+reduction approximate, and an approximate reduction cannot distinguish a real
+improvement from an accidental reimplementation difference. Three further
+assertions: adding a constant to every log-weight cannot change the output
+(renormalisation), a `-1e9` slot contributes exactly nothing (changing that
+slot's vector leaves the output unchanged), and a large positive log-weight
+pulls the pooled vector toward that slot.
+
+Cold-start impressions are kept, not excluded (consistent with Q4 §4's
+cold-start-is-a-slice framing): every slot is padding, so the improved
+variants produce a zero user vector and a fully tied ranking, which every
+metric handles.
+
+## 5. Inputs, sampling, and why the evaluation population is Q2's
+
+`nrms_inputs.ipynb` writes, per dataset:
+
+```
+data/kaggle_nrms/nrms_{dataset}_train.parquet   impression_id, user_id, impression_time,
+data/kaggle_nrms/nrms_{dataset}_val.parquet     article_ids_inview, article_ids_clicked
+data/kaggle_nrms/nrms_{dataset}_test.parquet
+data/kaggle_nrms/nrms_{dataset}_history.parquet user_id, article_id_sequence[<=20],
+                                                timestamp_sequence[<=20] (elapsed_time only)
+data/kaggle_nrms/{dataset}_article_embeddings.parquet   (staged copy of A1 Q3's)
+data/kaggle_nrms/nrms_inputs_manifest.json
+```
+
+Sampling has to happen locally: `ebnerd_large`'s `behaviors.parquet` is 24.6M
+rows / 7.8GB, of which `article_ids_inview` alone is 5.47GB (A2 Q1 §8).
+
+`val`/`test` are drawn by `sample_eval_impressions` — Q2's function verbatim,
+`EVAL_IMPRESSIONS = 200_000` at `EVAL_SEED = 0`, including the sort-before-
+sample detail that made it reproducible at all (A2 Q2 §4). So Q3's NRMS
+numbers and Q2's BM25/embedding/re-ranker numbers describe the same
+impressions and can be quoted in one table. This is asserted, not inferred
+from the shared seed: where `reranker_eval_{split}.parquet` exists,
+`test_eval_population` compares the two impression-id lists element by
+element. `train` is a 400,000-impression seeded sample, the cap A2 Q2 §9
+already measured a learning curve for.
+
+History is truncated to `HISTORY_SIZE = 20` and restricted to the users the
+three impression files actually reference (`ebnerd_large`'s `history.parquet`
+holds 974,791 users; the rest would be dead weight in the upload).
+`timestamp_sequence` is carried only for datasets that really have it, decided
+by **null count, not dtype** — the two MIND tracks write the same
+semantically-absent column with different types (`mind` as `Null`,
+`mind_large` as `String`, both 100% null), and a dtype test classified
+`mind_large` as having timestamps (A2 Q1 §3).
+
+The Kaggle notebook auto-discovers whichever `nrms_*_train.parquet` files are
+attached (same pattern as `compute_embeddings_kaggle.ipynb`), so a session can
+be scoped to one dataset when the GPU budget is tight, and finds
+`{dataset}_article_embeddings.parquet` anywhere under `/kaggle/input` so an
+existing A1 upload can be reused instead of re-staged.
+
+### Everything columnar, nothing materialised as Python objects
+
+The same trap A2 Q1 §8 and Q2 §5 document, avoided by construction here:
+article-id to matrix-row mapping is an explode + left join in polars, history
+matrices come out via `list.to_array(width).to_numpy()` (A2 Q2 §5 measured
+that conversion at 39× a list comprehension), and candidate sets are stored
+CSR-style — one flat `cand` array plus `offsets` — rather than padded to
+MIND's maximum in-view size of 299. Right-alignment with zero padding matches
+`truncate_history(padding_value=0)`, and index 0 is the article matrix's
+zero/unknown row, exactly as `create_lookup_objects` defines it;
+`test_inputs` checks our index and matrix against that function directly on a
+500-article sample, so the layout is verified against the authors' own
+definition rather than assumed.
+
+### Negative sampling
+
+Wu et al. (2019): one training sample per **distinct** clicked article, that
+positive plus `NPRATIO = 4` negatives drawn with replacement from the same
+impression's non-clicked candidates, shuffled, labelled one-hot over 5
+positions — which is what the softmax head and categorical cross-entropy
+expect. Distinct matters: EB-NeRD lists the same article twice in one
+impression's `article_ids_clicked` when it was clicked twice (A2 Q2 §11).
+Reimplemented in numpy at a fixed seed because their
+`sampling_strategy_wu2019` needs the pinned polars; `test_training_samples`
+verifies every sampled group against its source impression (the positive is
+clicked, the negatives are not), asserts bit-identical output on a re-run, and
+cross-checks their function on a small fixture when it imports.
+
+Early stopping runs on the **last calendar day** of the training sample,
+mirroring `ebnerd_nrms_docvec.py`'s own `last_dt` rule, with a chronological
+90/10 fallback for a track whose train split spans a single day. Our `val`
+split is therefore never used for model selection: it is reported, not tuned
+against.
+
+## 6. Scoring: user vectors once per impression, not once per candidate
+
+`ebnerd_nrms_docvec.py` scores through `model.scorer.predict(dataloader)`,
+which flattens every (impression, candidate) pair into its own row and
+re-encodes the user's whole 20-click history **once per candidate**. That is
+redundant by construction: `NRMSDocVec` scores by a dot product between a
+user vector that depends only on the history and a news vector that depends
+only on the article. So:
+
+- the news encoder runs once over the whole catalogue (125,541 / 104,151
+  articles, padding row included) per (dataset, variant), reused for both
+  splits;
+- the user encoder runs once per impression, chunked at `USER_BATCH = 1024`;
+- the score is their dot product — the same number the scorer's final `Dot`
+  layer produces, before a sigmoid that cannot reorder anything.
+
+This removes a factor of ~11.9 (EB-NeRD) to ~37 (MIND) of news-encoder work
+per split, and it is why the improvement was chosen to keep the user vector
+candidate-independent: a candidate-aware user encoder (the obvious
+alternative "attention over history" change) would reintroduce that factor at
+serving time as well as offline.
+
+`test_scoring_equivalence` checks the shortcut against
+`model.scorer.predict` on 128 impressions per variant: `sigmoid(dot)` matches
+their scorer within 1e-4, ranking flips are counted (tolerance 1 per 100
+impressions — a flip is only possible where two candidates sit closer than
+float32 noise, ~1e-6, which cannot move a reported metric), and the measured
+speedup is printed. The one-off catalogue encoding is excluded from both
+timings and amortises over every impression of both splits.
+
+## 7. Metrics and significance
+
+`auc_impression`, `mrr`, `ndcg_at_k`, `bootstrap_ci` and
+`paired_bootstrap_ci` are restated from
+`src/cs4406m26_assignment1c1/evaluation.py` because Kaggle has no access to
+the repo, and must stay identical — A1 and A2 Q2's numbers came from them.
+`test_metrics` pins them to hand-computed values, including the two
+tie-handling details that are silently wrong if changed (average ranks for
+AUC ties, stable argsort elsewhere) and the case where nDCG@10 falls *below*
+nDCG@5 (A2 Q2 §11): six positives at ranks 1–5 and 7 of eight candidates give
+nDCG@5 = 1.000 against nDCG@10 = 0.993078. It also reproduces A2 Q2 §8's
+paired-CI checks (covers a known +0.02 effect, excludes zero, ≥4× tighter than
+the unpaired interval on the same data, chunked equals unchunked at a fixed
+seed) and cross-checks the mean AUC against ebrec's own `AucScore` when their
+evaluation module imports — asserted outside the `try`, so a real
+disagreement fails instead of being reported as a skipped check.
+
+`nrms_metrics_{dataset}.json` mirrors `reranker_eval_metrics.json`'s shape
+(`hyperparameters`, `population`, `ranking_metrics`, `paired_comparison` with
+an `excludes_zero` flag per metric) so both files can be read by the same
+code. A claimed gain counts only where `excludes_zero` is true, and the
+design note quotes the interval rather than the point estimate.
+
+## 8. Gotchas that were designed around, not discovered late
+
+- **`metrics=["AUC"]` breaks early stopping after the first model.** Keras
+  auto-names metrics per session, so the second and third model built in one
+  kernel get `auc_1`/`auc_2`, and `EarlyStopping(monitor="val_auc")` then
+  silently monitors nothing (it warns and continues). Every variant is
+  compiled with `tf.keras.metrics.AUC(name="auc")` instead.
+- **The clone lives in `/tmp`, not `/kaggle/working`.** Everything under
+  `working` is packaged as the notebook's downloadable output, and the repo
+  carries ~2GB of example notebooks and plots.
+- **One variant resident at a time.** Each is built, fitted, scored, saved
+  and released (`clear_session`) before the next, so three models plus a
+  125,541 × 768 article matrix and an encoded catalogue are never resident
+  together — A1 Q4 §9 and A2 Q1 §8 are a long record of what happens when
+  separately-affordable transients are held at once.
+- **BatchNormalization defeats the naive smoke test.** The one-batch
+  learning check compares `train_on_batch`'s own training-mode losses, not
+  `evaluate()`: the news encoder's BN moving statistics have barely moved
+  after 20 steps, so an inference-mode comparison measures BN warm-up rather
+  than learning.
+
+## 9. Results
+
+Run on Kaggle (GPU T4 x2), three variants per dataset, every variant scored on
+the same 200,000 impressions per split. All three carry **1,304,720
+parameters** on both datasets, asserted at runtime, so nothing below is a
+capacity difference. Per-impression AUC:
+
+| dataset | split | baseline | masked_uniform | recency |
+|---|---|---|---|---|
+| `ebnerd_large` | val | 0.5701 | 0.5773 | 0.5757 |
+| `ebnerd_large` | test | 0.5835 | 0.5836 | **0.5845** |
+| `mind_large` | val | 0.6316 | 0.6323 | **0.6396** |
+| `mind_large` | test | 0.6307 | 0.6261 | **0.6349** |
+
+### The improvement holds on MIND and does not hold on EB-NeRD's test split
+
+Paired bootstrap 95% CI on `recency - baseline`, 1,000 iterations, identical
+impressions on both sides:
+
+| dataset | split | Δ AUC | Δ MRR | Δ nDCG@5 | Δ nDCG@10 |
+|---|---|---|---|---|---|
+| `mind_large` | val | **+0.0080** [+0.0071, +0.0090] | **+0.0109** | **+0.0090** | **+0.0083** |
+| `mind_large` | test | **+0.0042** [+0.0033, +0.0051] | **+0.0087** | **+0.0084** | **+0.0070** |
+| `ebnerd_large` | val | **+0.0056** [+0.0046, +0.0066] | **+0.0032** | **+0.0033** | **+0.0032** |
+| `ebnerd_large` | test | +0.0011 [−0.0000, +0.0021] | **−0.0021** | −0.0001 | **−0.0013** |
+
+Bold marks an interval that excludes zero. On `mind_large` all eight
+intervals exclude zero and all are positive: the improvement is confirmed on
+both splits, on every metric. On `ebnerd_large` the val split agrees, but the
+**test split does not**: AUC and nDCG@5 are indistinguishable from zero, and
+MRR and nDCG@10 are significantly *negative*. The honest statement is that
+this improvement is confirmed on one of the two datasets, and the assignment's
+"CI excludes zero" bar is met for MIND (both splits) and for EB-NeRD's val
+split only.
+
+### What the three-variant ablation attributes the gain to
+
+This is why the middle variant exists. Isolating the recency signal from the
+padding mask (`recency - masked_uniform`):
+
+| dataset | split | Δ AUC | verdict |
+|---|---|---|---|
+| `mind_large` | val | **+0.0073** [+0.0064, +0.0083] | recency signal carries it |
+| `mind_large` | test | **+0.0088** [+0.0078, +0.0097] | recency signal carries it |
+| `ebnerd_large` | val | **−0.0016** [−0.0025, −0.0008] | recency *subtracts*; the mask carries it |
+| `ebnerd_large` | test | +0.0010 [−0.0003, +0.0021] | indistinguishable |
+
+And the mask alone (`masked_uniform - baseline`): `mind_large` +0.0007 (ns) on
+val, **−0.0046** on test; `ebnerd_large` **+0.0072** on val, +0.0001 (ns) on
+test. So the two datasets attribute the same headline change to opposite
+causes:
+
+- On **MIND**, masking the padded history slots does nothing or slightly hurts,
+  and the ordinal recency prior is the entire effect.
+- On **EB-NeRD**, the val-split gain is the padding mask (+0.0072), with the
+  elapsed-time recency prior removing 0.0016 of it. A two-variant experiment
+  would have reported "+0.0056, CI excludes zero, improvement confirmed" here
+  and attributed it to recency, which the decomposition shows is wrong.
+
+Point estimates decompose exactly (means are linear over the same
+impressions), asserted by `test_payloads`: e.g. `ebnerd_large` val
++0.0072 + (−0.0016) = +0.0056.
+
+### A methodological artifact that weakens the EB-NeRD result specifically
+
+`split_by_last_day` reproduces `ebnerd_nrms_docvec.py`'s own rule (fit on
+everything before the training sample's last calendar day, monitor on that
+day). That rule interacts badly with A1's EB-NeRD cutoff. EB-NeRD's train
+split ends at **07:00**, so its last calendar day holds only 7 hours of
+impressions; MIND's ends at **midnight**, so its last day is a full one:
+
+| dataset | early-stopping samples | share of training sample |
+|---|---|---|
+| `ebnerd_large` | 15,056 | **3.8%** |
+| `mind_large` | 152,891 | 25.4% |
+
+Epoch selection visibly mattered on EB-NeRD and not on MIND. EB-NeRD's
+grouped val AUC *declines* after the first or second epoch
+(`masked_uniform` 0.6722 → 0.6519 → 0.6409), so `restore_best_weights` picked
+epoch 2 for the baseline and epoch 1 for both variants — three models stopped
+at different points on the basis of a 15,056-sample signal. MIND's rises
+monotonically and all three variants ran the full three epochs. The EB-NeRD
+val/test disagreement above is therefore consistent with a noisy epoch
+choice rather than with a property of the model, and that possibility cannot
+be separated from the data with this run alone.
+
+The fix, if this is revisited, is to carve the early-stopping set by a time
+*quantile* of the training sample rather than by calendar day — the
+`split_by_last_day` fallback already implements a chronological 90/10 cut and
+currently only triggers when the calendar-day rule degenerates entirely. That
+would make the two datasets' early-stopping sets comparable in size, at the
+cost of departing from the authors' exact protocol.
+
+### Cost
+
+Per variant, on one GPU session: `ebnerd_large` ~374-382s to fit and ~155s to
+score both splits; `mind_large` ~480-502s to fit and ~170s to score. Six fits
+and twelve scoring passes fit comfortably inside one session, which is what
+the user-vector-per-impression scoring path (#6) buys — the authors'
+per-candidate path would have multiplied the scoring half by ~11.9 and ~37.
