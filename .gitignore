@@ -41,6 +41,7 @@ updates.md
 test_beyond_accuracy.py
 ebnerd-benchmark/
 recommenders/
+artifacts/
 
 # A2 training/export artifacts (Q8 git policy)
 *.pt
