@@ -45,6 +45,83 @@ FEATURE_COLUMNS = BEHAVIOURAL_FEATURES + RETRIEVAL_FEATURES
 LABEL_COLUMN = "clicked"
 KEY_COLUMNS = ["impression_id", "article_id"]
 
+# The two blind leaderboard populations (SPEC.md A2 Q5 #6). Neither carries
+# `article_ids_clicked` or a train split of its own, so everything a feature
+# needs from *training-time* data comes from the dataset the booster was
+# fitted on: the popularity basis always, and for ebnerd_testset also the
+# article catalog and embeddings it shares with ebnerd_large. `article_prefix`
+# is (train dataset's prefix, population's prefix): ebnerd_testset was
+# written with ebnerd_large's article ids verbatim (its catalog is identical,
+# see ebnerd_testset_submission.ipynb), MINDlarge_test with its own namespace,
+# so mind_large's train click counts have to be re-keyed before they can be
+# looked up by a mind_large_test candidate.
+SUBMISSION_POPULATIONS = {
+    "ebnerd_testset": {
+        "train_dataset": "ebnerd_large",
+        "catalog_dataset": "ebnerd_large",
+        "article_prefix": ("ebnerd_large_", "ebnerd_large_"),
+        "prediction_filename": "predictions.txt",
+        "strip_impression_prefix": True,
+    },
+    "mind_large_test": {
+        "train_dataset": "mind_large",
+        "catalog_dataset": "mind_large_test",
+        "article_prefix": ("mind_large_", "mind_large_test_"),
+        "prediction_filename": "prediction.txt",
+        "strip_impression_prefix": False,
+    },
+}
+
+
+def population_article_id(population: str, article_id: str) -> str:
+    """Re-key a train-dataset article id into `population`'s namespace
+    (identity when the two share a prefix, or the id is not a train id)."""
+    src, dst = SUBMISSION_POPULATIONS[population]["article_prefix"]
+    # `dst` checked first: "mind_large_" is itself a prefix of
+    # "mind_large_test_", so an already-population id would otherwise match
+    # `src` and be re-prefixed a second time.
+    if src == dst or article_id.startswith(dst) or not article_id.startswith(src):
+        return article_id
+    return dst + article_id[len(src):]
+
+
+def write_user_sorted_source(lf, path, n_buckets: int = 16) -> int:
+    """Write `lf` to `path` ordered by (`user_id`, `impression_id`), bounded
+    in memory, and return the row count.
+
+    A user-contiguous order is what makes the Stage-1 BM25 adapter's
+    one-entry cache pay off (one corpus-wide `get_scores` per user instead of
+    per impression: ~8x on ebnerd_testset's ~17 impressions per user). A
+    plain `lf.sort(...).sink_parquet(...)` on the 13,536,710-row ebnerd_testset
+    behaviors measured a 10.1GB peak on this 15.7GB machine, so the sort is
+    done as an external sort instead: rows are bucketed by a hash of
+    `user_id`, each bucket (~1/n_buckets of the rows) is sorted in memory and
+    written, and the buckets are concatenated. Every impression of a user
+    lands in one bucket, so the result is user-contiguous; sorting by
+    `impression_id` as well makes the order a total one, so two callers that
+    build it independently (feature_engineering.ipynb and
+    reranker_submission.ipynb) get row-identical files and can align their
+    chunks by position without a join.
+    """
+    import os
+    import shutil
+
+    import polars as pl
+
+    bucket_dir = path.parent / (path.stem + "_buckets")
+    bucket_dir.mkdir(parents=True, exist_ok=True)
+    bucket_expr = pl.col("user_id").hash(seed=0) % n_buckets
+    bucket_paths = []
+    for b in range(n_buckets):
+        bucket_path = bucket_dir / f"bucket_{b:02d}.parquet"
+        lf.filter(bucket_expr == b).sort("user_id", "impression_id").collect().write_parquet(bucket_path)
+        bucket_paths.append(bucket_path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    pl.concat([pl.scan_parquet(p) for p in bucket_paths]).sink_parquet(tmp)
+    os.replace(tmp, path)
+    shutil.rmtree(bucket_dir)
+    return pl.scan_parquet(path).select(pl.len()).collect().item()
+
 
 def feature_matrix(df, columns=FEATURE_COLUMNS) -> np.ndarray:
     """`(n_rows, len(columns))` float32 matrix in `columns` order.

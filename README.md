@@ -775,6 +775,38 @@ To print the headline figures without re-running:
 uv run python benchmarks/verify_a2q4_claims.py
 ```
 
+## Extended evaluation: all metrics, slices, CIs (Assignment 2, Q5)
+
+```bash
+RERANK_EVAL_DATASETS=ebnerd_large uv run python reranker_evaluation.py
+RERANK_EVAL_DATASETS=mind_large uv run python reranker_evaluation.py
+```
+
+The same notebook as the Q2 comparison — [`src/reranker_evaluation.ipynb`](src/reranker_evaluation.ipynb)
+— now also computes, for all three methods on the identical 200,000-impression
+sample per split: ILD, novelty and top-10 coverage alongside AUC/MRR/nDCG, the
+`cold_start`/`warm` and `head`/`tail` slices, and a bootstrap 95% CI on every
+(method, slice, metric). Definitions are A1 Q4's verbatim. Results land in
+`data/processed/{dataset}/reranker_eval_metrics.json` under `extended_metrics`,
+in exactly `eval_metrics.json`'s shape. A run whose `reranker_eval_{split}.parquet`
+already exists skips scoring entirely, so this is minutes, not hours.
+
+### Verifying this section's numeric claims
+
+Every table in `SPEC.md` A2 Q5 §3–§5, plus the cross-check that the sampled
+ILD/novelty for the two baselines reproduce A1's full-population values:
+
+```bash
+uv run python benchmarks/verify_a2q5_claims.py
+```
+
+The head-slice mechanism in `SPEC.md` A2 Q5 §4 (clicked head articles are a
+median 239 h old vs 3.1 h for tail; the re-ranker ranks them a median 7th of 11):
+
+```bash
+uv run python benchmarks/verify_a2q5_claims.py head-diagnostic
+```
+
 ## Dataset location
 
 Raw datasets are gitignored and must be placed at the repo root before running anything,

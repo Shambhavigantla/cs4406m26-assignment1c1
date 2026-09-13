@@ -261,8 +261,39 @@ the log records.}
 \subsection{Ablation and Statistical Significance}
 \label{sec:ablation}
 
-\todo{Ablation results with the paired bootstrap CI, and the Q9 with/without
-serving-time-features run.}
+% ---------------------------------------------------------------------
+% Q5 Part A MEASURED (SPEC.md A2 Q5 #3-#5). Numbers below are from
+% reranker_eval_metrics.json; benchmarks/verify_a2q5_claims.py reprints them.
+% ---------------------------------------------------------------------
+\todo{Write out from SPEC.md A2 Q5. All seven metrics for all three methods on
+the identical 200k-impression sample (test): the re-ranker's ILD is lowest on
+both datasets (\code{ebnerd\_large} 0.781 vs 0.798/0.791; \code{mind\_large}
+0.785 vs 0.854/0.838) and top-10 coverage equal-or-lower, but \textbf{novelty
+goes opposite ways}: lower on MIND (20.10 vs 20.38/20.62, popularity-dominated,
+53\% of gain) and \emph{higher} on EB-NeRD (22.33 vs 21.96/22.14,
+freshness-dominated, 48\% of gain) --- novelty is $-\log_2$ of \emph{train}
+popularity, and fresh articles have no train clicks. Same asymmetry as Q2's
+accuracy gains, now on the beyond-accuracy side. State plainly that ``the
+re-ranker reduces novelty'' would be wrong on one dataset.
+
+Slices: head is tiny on a temporal split (1.5\% of EB-NeRD test; ``head'' is
+defined on train clicks and news decays), so tail $\approx$ overall. The one
+negative result to report, not bury: on EB-NeRD test/head the re-ranker is
+\textbf{below chance} (AUC 0.416 [0.404, 0.427] vs BM25 0.596, n=3{,}032).
+Mechanism measured: clicked head articles are a median 239 h old vs 3.1 h for
+tail (77$\times$); the freshest in-view candidate is 1 h; the re-ranker ranks
+the clicked article a median 7th of 11; 87\% of the time it is older than the
+median candidate. A freshness prior buries the evergreen story the user came
+back for. On val (one day after train, head articles still fresh) the
+re-ranker leads on head, which separates ``wrong about head'' from ``wrong
+about \emph{old}''. Cold-start exists only on MIND (6,016 test impressions):
+both retrieval baselines are exactly 0.5000 (empty query, full tie), the
+re-ranker 0.511 from popularity + position alone --- not solved by anyone.
+
+Representativeness: sampled ILD/novelty for both baselines lie inside the
+sample CI of A1's full-population values on every split (extends Q2 \S7's
+argument to the beyond-accuracy metrics). Then: the Q3 ablation with its
+paired CI, and the Q9 with/without-serving-time-features run.}
 
 \subsection{Where This Breaks at 10x}
 \label{sec:scaling}

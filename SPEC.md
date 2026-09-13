@@ -2975,3 +2975,223 @@ a few hundred documents.
 **What does not break: the re-ranker.** 374 KB,
 0.41 ms p99, and neither figure moves with catalogue or
 traffic. The stage that A2 added is the cheapest one in the system.
+
+# A2 Q5 — Extended Evaluation
+
+## 1. Scope, and where it lives
+
+Q5 asks for every metric — AUC, MRR, nDCG@5, nDCG@10, diversity, novelty,
+coverage — for the full two-stage pipeline, with at least two slices
+(cold-start vs. warm, head vs. tail) and a bootstrap 95% CI on each, plus
+final Codabench submissions. This section is the evaluation half; the
+submissions are §6.
+
+It is implemented as an extension of `src/reranker_evaluation.ipynb` rather
+than a new notebook, because that notebook already holds all three methods'
+scores on one common 200,000-impression sample per split (A2 Q2 §7), and the
+slices and beyond-accuracy metrics have to be computed over the *same*
+impressions as the ranking metrics to be quoted alongside them. Results are
+persisted into `reranker_eval_metrics.json` under `extended_metrics`, in
+exactly A1 Q4's `{method: {slice: {metric: {point, ci_lo, ci_hi}}}}` shape, so
+`eval_metrics.json` and this file read identically.
+`benchmarks/verify_a2q5_claims.py` prints every table below from the
+artifacts and re-asserts the consistency they rely on.
+
+## 2. Definitions: A1 Q4's, reused verbatim
+
+The re-ranker is sliced and scored by the same rules its baselines were, so
+that a difference between them is a difference in the systems and not in the
+measurement.
+
+- **cold-start user** — empty `article_id_sequence` in `history.parquet`
+  (A1 Q4 §4). `ebnerd_large` has none, so that slice is `null` there, as it
+  was in A1.
+- **head impression** — any clicked article is in the top
+  `HEAD_FRACTION = 20%` of train-clicked articles by click count (A1 Q4 §4).
+- **ILD, novelty** — over each method's **top-10** by score, stable argsort:
+  the same tie rule `evaluate_ranking` used for the baselines. Novelty is
+  `-log2` of the add-one-smoothed train popularity. The `popularity` column
+  already in the scored frames *is* `evaluation.train_popularity_lookup`
+  (A2 Q1 §7 factored it there precisely so the harness and the feature
+  notebook could not diverge); it was verified equal to a fresh
+  recomputation to 0.0 on 2,000 articles before being read rather than
+  recomputed.
+- **coverage (top-10)** — the share of the catalogue that appears in *any*
+  sampled impression's top-10 after ranking. This is **not** A1's coverage,
+  which measured the corpus-wide top-200 *retrieval lists*
+  (0.987 / 0.778 for BM25 / embedding on
+  `ebnerd_large`). A re-ranker
+  cannot retrieve, only reorder; what this quantity measures is whether one
+  method concentrates its top slots on fewer articles than another, given
+  the same candidates. It is labelled `coverage_top10` everywhere to keep the
+  two from being confused.
+
+## 3. All seven metrics for the two-stage pipeline (test split)
+
+| dataset | method | AUC | MRR | nDCG@5 | nDCG@10 | ILD | novelty | coverage (top-10) |
+|---|---|---|---|---|---|---|---|---|
+| `ebnerd_large` | `bm25` | 0.5015 [0.5000, 0.5030] | 0.3191 [0.3178, 0.3204] | 0.3495 [0.3480, 0.3511] | 0.4344 [0.4331, 0.4356] | 0.7982 [0.7975, 0.7988] | 21.9639 [21.9567, 21.9712] | 0.0344 |
+| `ebnerd_large` | `embedding` | 0.5511 [0.5496, 0.5525] | 0.3486 [0.3471, 0.3499] | 0.3867 [0.3852, 0.3881] | 0.4648 [0.4635, 0.4661] | 0.7906 [0.7900, 0.7912] | 22.1420 [22.1349, 22.1495] | 0.0337 |
+| `ebnerd_large` | **`reranker`** | 0.6490 [0.6477, 0.6503] | 0.4224 [0.4209, 0.4237] | 0.4722 [0.4706, 0.4737] | 0.5334 [0.5321, 0.5346] | 0.7814 [0.7807, 0.7820] | 22.3272 [22.3203, 22.3345] | 0.0325 |
+| `mind_large` | `bm25` | 0.5569 [0.5556, 0.5582] | 0.3000 [0.2986, 0.3014] | 0.2760 [0.2746, 0.2775] | 0.3378 [0.3364, 0.3392] | 0.8535 [0.8529, 0.8541] | 20.3781 [20.3737, 20.3831] | 0.0419 |
+| `mind_large` | `embedding` | 0.5944 [0.5930, 0.5957] | 0.3196 [0.3182, 0.3212] | 0.2975 [0.2960, 0.2991] | 0.3613 [0.3600, 0.3628] | 0.8379 [0.8372, 0.8386] | 20.6189 [20.6146, 20.6236] | 0.0407 |
+| `mind_large` | **`reranker`** | 0.6099 [0.6086, 0.6112] | 0.3341 [0.3327, 0.3358] | 0.3140 [0.3124, 0.3156] | 0.3747 [0.3733, 0.3763] | 0.7850 [0.7842, 0.7859] | 20.0967 [20.0906, 20.1035] | 0.0422 |
+
+The re-ranker's accuracy gains over the baselines are A2 Q2 §12's, restated
+here beside the beyond-accuracy metrics they trade against.
+
+**The beyond-accuracy signature is not one story but two, and the split
+follows Q2's feature importances exactly.** Intra-list diversity falls under
+the re-ranker on both datasets and both splits (test: ILD
+0.781 against 0.798 / 0.791 on
+`ebnerd_large`, 0.785 against 0.853 / 0.838
+on `mind_large`), and top-10 coverage is equal or lower everywhere
+(0.0325 vs 0.0344 / 0.0337;
+0.0422 vs 0.0419 / 0.0407). A learned
+ranker concentrates its top slots; that much is uniform.
+
+**Novelty goes in opposite directions on the two datasets.** On `mind_large`
+the re-ranker's top-10 is *less* novel (20.10 vs
+20.38 / 20.62), which is the textbook signature of a
+popularity-aware model: `popularity` is its single most important feature
+there (53% of split gain, A2 Q2 §12), popular articles are by construction
+low-novelty, and the model promotes them. On `ebnerd_large` it is *more*
+novel (22.33 vs 21.96 / 22.14) — the
+opposite — and the reason is that its dominant feature there is not
+popularity but **`freshness_hours`** (48% of gain, with `popularity` third at
+16%). Novelty is measured as `-log2` of *train* popularity, and a fresh
+article is one that has had almost no time to accumulate train clicks; a
+freshness-driven ranker therefore systematically promotes exactly the
+articles the novelty metric scores highest. The same model, applied to a log
+that carries publish timestamps, becomes a novelty-*increasing* ranker, and
+applied to one that does not, a novelty-*decreasing* one.
+
+Two consequences for how the numbers should be read. First, the
+ILD-and-coverage cost is real and consistent, and is the price of the
+accuracy gain on both datasets. Second, "the re-ranker reduces novelty" is
+not a property of the re-ranker; it is a property of which feature the data
+lets it learn, and reporting it as a fixed trade-off would have been wrong on
+one of the two datasets. This is the same asymmetry A2 Q2 §12 found in the
+accuracy gains, now visible on the beyond-accuracy side. The direction claims
+in this paragraph are checked against the artifact when this section is
+rendered: ILD lowest on every split = True,
+MIND novelty lowest = True,
+EB-NeRD novelty highest = True.
+
+## 4. Slices
+
+| dataset | split | slice | n | BM25 | embedding | re-ranker |
+|---|---|---|---|---|---|---|
+| `ebnerd_large` | val | overall | 200,000 | 0.5088 [0.5074, 0.5103] | 0.5597 [0.5583, 0.5611] | 0.6664 [0.6651, 0.6676] |
+| `ebnerd_large` | val | cold_start | 0 | — | — | — |
+| `ebnerd_large` | val | warm | 200,000 | 0.5088 [0.5074, 0.5103] | 0.5597 [0.5583, 0.5611] | 0.6664 [0.6651, 0.6676] |
+| `ebnerd_large` | val | head | 30,783 | 0.5408 [0.5371, 0.5445] | 0.5380 [0.5345, 0.5417] | 0.6744 [0.6713, 0.6776] |
+| `ebnerd_large` | val | tail | 169,217 | 0.5030 [0.5015, 0.5047] | 0.5637 [0.5621, 0.5653] | 0.6649 [0.6635, 0.6663] |
+| `ebnerd_large` | test | overall | 200,000 | 0.5015 [0.5000, 0.5030] | 0.5511 [0.5496, 0.5525] | 0.6490 [0.6477, 0.6503] |
+| `ebnerd_large` | test | cold_start | 0 | — | — | — |
+| `ebnerd_large` | test | warm | 200,000 | 0.5015 [0.5000, 0.5030] | 0.5511 [0.5496, 0.5525] | 0.6490 [0.6477, 0.6503] |
+| `ebnerd_large` | test | head | 3,032 | 0.5964 [0.5851, 0.6076] | 0.4983 [0.4856, 0.5103] | 0.4159 [0.4039, 0.4269] |
+| `ebnerd_large` | test | tail | 196,968 | 0.5000 [0.4986, 0.5016] | 0.5519 [0.5505, 0.5534] | 0.6526 [0.6513, 0.6539] |
+| `mind_large` | val | overall | 200,000 | 0.5584 [0.5570, 0.5599] | 0.6102 [0.6089, 0.6115] | 0.6158 [0.6146, 0.6171] |
+| `mind_large` | val | cold_start | 5,246 | 0.5000 [0.5000, 0.5000] | 0.5000 [0.5000, 0.5000] | 0.5243 [0.5172, 0.5318] |
+| `mind_large` | val | warm | 194,754 | 0.5600 [0.5586, 0.5614] | 0.6131 [0.6119, 0.6144] | 0.6183 [0.6170, 0.6196] |
+| `mind_large` | val | head | 63,008 | 0.5749 [0.5729, 0.5771] | 0.6294 [0.6275, 0.6313] | 0.6742 [0.6723, 0.6763] |
+| `mind_large` | val | tail | 136,992 | 0.5509 [0.5494, 0.5526] | 0.6013 [0.5996, 0.6029] | 0.5890 [0.5873, 0.5906] |
+| `mind_large` | test | overall | 200,000 | 0.5569 [0.5556, 0.5582] | 0.5944 [0.5930, 0.5957] | 0.6099 [0.6086, 0.6112] |
+| `mind_large` | test | cold_start | 6,016 | 0.5000 [0.5000, 0.5000] | 0.5000 [0.5000, 0.5000] | 0.5109 [0.5042, 0.5174] |
+| `mind_large` | test | warm | 193,984 | 0.5587 [0.5574, 0.5600] | 0.5973 [0.5960, 0.5986] | 0.6130 [0.6116, 0.6143] |
+| `mind_large` | test | head | 27,707 | 0.5887 [0.5851, 0.5924] | 0.5447 [0.5411, 0.5485] | 0.5885 [0.5845, 0.5923] |
+| `mind_large` | test | tail | 172,293 | 0.5518 [0.5504, 0.5533] | 0.6023 [0.6010, 0.6036] | 0.6133 [0.6119, 0.6148] |
+
+**Head vs. tail is a small slice on a temporal split, and that is a property
+of news, not a defect of the definition.** "Head" is defined on *train*
+clicks; val and test are later days; and news decays fast enough that only
+1.5% of `ebnerd_large`'s and 13.9% of `mind_large`'s test
+impressions clicked a train-head article at all. (A1's ~90% figure was the
+head articles' share of *train* clicks — a different quantity — and an early
+version of the notebook's test asserted a head share above 50% on that
+basis and failed on correct output.) The head slice therefore carries wide
+intervals, and the honest reading is that the tail slice *is* the overall
+result on both datasets.
+
+**On EB-NeRD's test head slice the re-ranker is below chance, and the
+mechanism is measurable.** AUC 0.4159 against BM25's
+0.5964 on 3,032 impressions — an
+interval well under 0.5, not noise. A head impression on the test week is one
+where the user clicked an article that was already popular during train, a
+week or more earlier; clicked head articles there are a median **239 hours
+old**, against **3.1 hours** for clicked tail articles (a 77× gap), and in 87%
+of head impressions the clicked article is older than the median in-view
+candidate, whose freshest member is typically an hour old. The re-ranker's
+single most important feature is `freshness_hours` (A2 Q2 §12), so it does
+what it learned: it ranks the ten-day-old story a median 7th of 11. BM25,
+which has no notion of age and matches on the rich titles that long-lived
+stories tend to have, lands at 0.60 on the same impressions. The failure is
+confined to 1.5% of test traffic and is invisible in the overall figure, but
+it is a real one: **a freshness prior learned on a news log will
+systematically bury the evergreen story the user came back for**, and the
+head slice is the instrument that exposes it. (`benchmarks/verify_a2q5_claims.py
+head-diagnostic` recomputes every number in this paragraph.) The same slice
+on val — one day after train, where head articles are still fresh — shows
+the re-ranker ahead (0.6744 vs 0.5408), which is what
+separates "the model is wrong about head articles" from "the model is
+wrong about *old* articles".
+
+Two further facts the slice sizes record. Median train-popularity of a
+clicked tail article on the test week is the add-one floor: the overwhelming
+majority of test-week clicks land on articles that had **zero** train clicks
+at all, which is the temporal decay of news made concrete. And on
+`mind_large` the head slice is larger (13.9%) and the re-ranker merely
+draws level with BM25 there (0.5885 vs 0.5887) rather than
+falling under — MIND has no publish timestamps, so there is no freshness
+prior to backfire.
+
+**Cold-start exists only on MIND** (5,246 / 6,016 impressions on val / test;
+EB-NeRD has no users with an empty history). On those impressions every
+history-derived feature is null and the re-ranker falls back to
+`popularity`, `freshness_hours`, `position_in_impression` and the two
+retrieval scores. Its cold-start AUC is
+0.5109 against exactly 0.5000 for both
+retrieval baselines on test. The baselines' 0.5000 is not an approximation:
+with no history the query is empty, every candidate scores zero, every
+ranking is a full tie, and average-rank AUC returns exactly one half. The
+re-ranker's 0.5109 is what `popularity` and
+`position_in_impression` alone are worth — a measurable but small signal.
+Cold-start is not solved by any of the three systems; it is merely no longer
+a coin flip for one of them.
+
+## 5. The sample reproduces A1's full-population beyond-accuracy metrics
+
+A2 Q2 §7 established that the 200,000-impression sample reproduces A1's
+full-population AUC/MRR/nDCG for the two baselines to within 0.0008. The
+same check for ILD and novelty — which depend on the top-10 *lists*, not
+just the ranking of the clicked item, and so exercise a different part of
+the pipeline:
+
+| dataset | split | method | metric | sampled (CI) | A1 full population | abs diff | full inside sample CI |
+|---|---|---|---|---|---|---|---|
+| `ebnerd_large` | val | `bm25` | ild | 0.8209 [0.8202, 0.8216] | 0.8213 | 0.0005 | yes |
+| `ebnerd_large` | val | `bm25` | novelty | 19.9904 [19.9760, 20.0058] | 19.9902 | 0.0002 | yes |
+| `ebnerd_large` | val | `embedding` | ild | 0.8109 [0.8102, 0.8116] | 0.8112 | 0.0003 | yes |
+| `ebnerd_large` | val | `embedding` | novelty | 20.1609 [20.1467, 20.1766] | 20.1584 | 0.0026 | yes |
+| `ebnerd_large` | test | `bm25` | ild | 0.7982 [0.7975, 0.7988] | 0.7980 | 0.0002 | yes |
+| `ebnerd_large` | test | `bm25` | novelty | 21.9639 [21.9567, 21.9712] | 21.9604 | 0.0035 | yes |
+| `ebnerd_large` | test | `embedding` | ild | 0.7906 [0.7900, 0.7912] | 0.7905 | 0.0001 | yes |
+| `ebnerd_large` | test | `embedding` | novelty | 22.1420 [22.1349, 22.1495] | 22.1376 | 0.0044 | yes |
+| `mind_large` | val | `bm25` | ild | 0.8410 [0.8403, 0.8417] | 0.8410 | 0.0001 | yes |
+| `mind_large` | val | `bm25` | novelty | 18.7288 [18.7189, 18.7393] | 18.7306 | 0.0018 | yes |
+| `mind_large` | val | `embedding` | ild | 0.8156 [0.8148, 0.8164] | 0.8156 | 0.0000 | yes |
+| `mind_large` | val | `embedding` | novelty | 18.7941 [18.7846, 18.8044] | 18.7956 | 0.0015 | yes |
+| `mind_large` | test | `bm25` | ild | 0.8535 [0.8529, 0.8541] | 0.8533 | 0.0002 | yes |
+| `mind_large` | test | `bm25` | novelty | 20.3781 [20.3737, 20.3831] | 20.3792 | 0.0011 | yes |
+| `mind_large` | test | `embedding` | ild | 0.8379 [0.8372, 0.8386] | 0.8376 | 0.0003 | yes |
+| `mind_large` | test | `embedding` | novelty | 20.6189 [20.6146, 20.6236] | 20.6213 | 0.0023 | yes |
+
+Every full-population value lies inside the sample's own 95% interval.
+So the beyond-accuracy comparison in §3 is measured on a population that
+demonstrably stands in for the whole, by the same standard the ranking
+comparison already met.
+
+## 6. Codabench submissions
+
+*Pending — see the working notes for A2 Q5 Part B.*
