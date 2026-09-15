@@ -85,39 +85,93 @@ def population_article_id(population: str, article_id: str) -> str:
     return dst + article_id[len(src):]
 
 
-def write_user_sorted_source(lf, path, n_buckets: int = 16) -> int:
-    """Write `lf` to `path` ordered by (`user_id`, `impression_id`), bounded
-    in memory, and return the row count.
+def write_user_sorted_source(source_path, path, columns, n_buckets: int = 16,
+                             batch_rows: int = 16_384, row_group_size: int = 131_072) -> int:
+    """Write the `columns` of the parquet file at `source_path` to `path`
+    ordered by (`user_id`, `impression_id`), in bounded memory, and return
+    the row count. Row-identical to `scan_parquet(source_path).select(columns)
+    .sort("user_id", "impression_id")`.
 
     A user-contiguous order is what makes the Stage-1 BM25 adapter's
     one-entry cache pay off (one corpus-wide `get_scores` per user instead of
-    per impression: ~8x on ebnerd_testset's ~17 impressions per user). A
-    plain `lf.sort(...).sink_parquet(...)` on the 13,536,710-row ebnerd_testset
-    behaviors measured a 10.1GB peak on this 15.7GB machine, so the sort is
-    done as an external sort instead: rows are bucketed by a hash of
-    `user_id`, each bucket (~1/n_buckets of the rows) is sorted in memory and
-    written, and the buckets are concatenated. Every impression of a user
-    lands in one bucket, so the result is user-contiguous; sorting by
-    `impression_id` as well makes the order a total one, so two callers that
-    build it independently (feature_engineering.ipynb and
-    reranker_submission.ipynb) get row-identical files and can align their
-    chunks by position without a join.
+    per impression: ~8x on ebnerd_testset's ~17 impressions per user). On the
+    13,536,710-row ebnerd_testset behaviors a plain `sort(...).sink_parquet`
+    peaked at 10.1GB on this 15.7GB machine, and even a filter-per-bucket
+    rewrite peaked at 6.2GB, because polars' parquet reader materializes the
+    whole file to evaluate a string predicate no row-group statistic can
+    prune. So this is an external range sort driven one row group at a
+    time through pyarrow: the distinct user ids (a few hundred thousand
+    short strings) are sorted once and cut into `n_buckets` contiguous key
+    ranges; each row group is read, split by range and appended to one
+    parquet writer per bucket; each bucket (~1/n_buckets of the rows) is
+    then sorted in memory and the buckets concatenated in range order.
+    Measured peak 1.5GB on ebnerd_testset (SPEC.md A2 Q5 #6). Because the buckets partition the key space in
+    sorted order the concatenation is globally sorted -- not merely
+    user-contiguous, as hash bucketing would be -- and the order depends on
+    nothing but the data, so two callers that build it independently
+    (feature_engineering.ipynb and reranker_submission.ipynb) get
+    row-identical files and can align their chunks by position without a
+    join.
     """
+    import gc
     import os
     import shutil
 
     import polars as pl
+    import pyarrow.parquet as pq
+
+    users = pl.scan_parquet(source_path).select("user_id").unique().sort("user_id").collect()["user_id"]
+    n_users = users.len()
+    cuts = [users[min(int(round(k * n_users / n_buckets)), n_users - 1)] for k in range(1, n_buckets)] if n_users else []
+    n_buckets = len(cuts) + 1
+    del users
+    bucket_expr = pl.lit(n_buckets - 1, dtype=pl.Int32)
+    for b in range(n_buckets - 2, -1, -1):
+        bucket_expr = pl.when(pl.col("user_id") < cuts[b]).then(pl.lit(b, dtype=pl.Int32)).otherwise(bucket_expr)
 
     bucket_dir = path.parent / (path.stem + "_buckets")
+    shutil.rmtree(bucket_dir, ignore_errors=True)
     bucket_dir.mkdir(parents=True, exist_ok=True)
-    bucket_expr = pl.col("user_id").hash(seed=0) % n_buckets
-    bucket_paths = []
-    for b in range(n_buckets):
-        bucket_path = bucket_dir / f"bucket_{b:02d}.parquet"
-        lf.filter(bucket_expr == b).sort("user_id", "impression_id").collect().write_parquet(bucket_path)
-        bucket_paths.append(bucket_path)
+    bucket_paths = [bucket_dir / f"bucket_{b:02d}.parquet" for b in range(n_buckets)]
+    writers = [None] * n_buckets
+    # Fixed-row batches rather than whole row groups: ebnerd_testset's last
+    # two row groups hold its 200,000 beyond-accuracy impressions, ~250
+    # candidates each, so one row group is 763MB of Arrow where the others
+    # are 44MB, and the polars round-trip on it alone peaked at 3.7GB.
+    source = pq.ParquetFile(source_path)
+    for batch in source.iter_batches(batch_size=batch_rows, columns=list(columns)):
+        frame = pl.from_arrow(batch).with_columns(bucket_expr.alias("_bucket"))
+        for (b,), part in frame.partition_by("_bucket", as_dict=True).items():
+            table = part.drop("_bucket").to_arrow()
+            if writers[b] is None:
+                writers[b] = pq.ParquetWriter(bucket_paths[b], table.schema)
+            writers[b].write_table(table)
+        del batch, frame, part, table
+        gc.collect()
+    for w in writers:
+        if w is not None:
+            w.close()
+
+    # Each bucket is sorted in memory and appended straight into the final
+    # file through one writer, so no sorted copy of a bucket is ever on disk
+    # and the peak is one bucket's sort rather than a 16-way parallel
+    # streaming concat (which measured a further +1GB on its own).
     tmp = path.with_suffix(path.suffix + ".tmp")
-    pl.concat([pl.scan_parquet(p) for p in bucket_paths]).sink_parquet(tmp)
+    final_writer = None
+    for b, bucket_path in enumerate(bucket_paths):
+        if writers[b] is None:
+            continue
+        table = pl.read_parquet(bucket_path).sort("user_id", "impression_id").to_arrow()
+        if final_writer is None:
+            final_writer = pq.ParquetWriter(tmp, table.schema)
+        final_writer.write_table(table, row_group_size=row_group_size)
+        del table
+        bucket_path.unlink()
+        gc.collect()
+    if final_writer is not None:
+        final_writer.close()
+    else:  # empty source: still produce a valid (empty) file with the right columns
+        pl.scan_parquet(source_path).select(list(columns)).head(0).collect().write_parquet(tmp)
     os.replace(tmp, path)
     shutil.rmtree(bucket_dir)
     return pl.scan_parquet(path).select(pl.len()).collect().item()

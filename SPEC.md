@@ -3194,4 +3194,145 @@ comparison already met.
 
 ## 6. Codabench submissions
 
-*Pending — see the working notes for A2 Q5 Part B.*
+The full two-stage pipeline — Stage-1 BM25 and frozen-embedding
+`score_inview` over each impression's `article_ids_inview`, A2 Q1's
+behavioural features, and the A2 Q2 LightGBM re-ranker — is run over both
+blind leaderboard populations and submitted in the formats A1 Q5
+established. Two notebooks, one population per kernel:
+`src/feature_engineering.ipynb` (`FEATURE_DATASETS={population}`) builds the
+feature table, and the new `src/reranker_submission.ipynb`
+(`SUBMISSION_DATASETS={population}`) scores Stage-1, assembles the design
+matrix, re-ranks and writes the zip. `benchmarks/verify_a2q5_claims.py
+submissions` reprints every number below from the artifacts and re-checks
+each zip line by line against `behaviors.parquet`.
+
+### 6.1 The blind populations and where their training-time inputs come from
+
+| | `mind_large_test` | `ebnerd_testset` |
+|---|---|---|
+| impressions | 2,370,727 | 13,536,710 |
+| candidates / impression | 39.28 | 15.21 |
+| feature rows | 93,115,001 | 205,925,868 |
+| `article_ids_clicked` | absent | absent |
+| article catalog / embeddings | its own (A1 Q5's merged 120,961-article set) | `ebnerd_large`'s (identical catalog, A1 Q5 §8) |
+| popularity basis | `mind_large` train clicks, re-keyed `mind_large_` → `mind_large_test_` | `ebnerd_large` train clicks (ids already shared) |
+| re-ranker | `reranker_model_mind_large.txt` (45 trees) | `reranker_model_ebnerd_large.txt` (53 trees) |
+
+`reranker.SUBMISSION_POPULATIONS` holds this mapping. Two consequences of
+"no labels" are handled explicitly rather than by null-filling. `clicked` is
+a null Boolean column, and the `popularity` lookup is the training dataset's
+lookup verbatim — built over the *training* catalog so the add-one smoothing
+denominator is the one the booster saw, then re-keyed into the population's
+namespace; an article the population adds after training (MINDlarge_test's
+test-only news) receives the same smoothed-zero value a never-clicked
+training article does (3.55e-07 on MIND, identical to the labelled test
+split's minimum). On the blind MIND set 7.3% of candidate rows carry a
+train-known popularity against 17.7% on the labelled `mind_large` test
+split, one week closer to training — the expected temporal decay, not a
+namespace failure (the notebook asserts >1,000 re-keyed hits).
+
+`clicks_earlier_in_session` is the one feature a live system would have but
+the blind sets cannot carry (it counts clicks in *earlier* impressions of the
+session, and no click is labelled). It is null in the feature table and
+imputed with 0 at scoring time on EB-NeRD — the modal training value
+(45.6% of rows) and, checked on real rows in the notebook, prediction-
+identical to leaving it NaN: LightGBM substitutes 0 for a missing value in a
+feature that had no missing values at training time. On MIND the feature was
+null for every training row and stays null. It carries 0.3% of the EB-NeRD
+booster's gain and none of MIND's.
+
+### 6.2 `impression_id` is not a key on `ebnerd_testset`
+
+All 200,000 beyond-accuracy rows share the sentinel `impression_id` 0 — one
+row per user, one shared 250-article candidate list (A1 SPEC.md Q5 §8 hit
+this twice; this is the third time, by a different path). The per-chunk
+session-feature attach, keyed on `impression_id` alone, became a
+200,000 × 200,000 self-product: Windows' Resource-Exhaustion-Detector
+(event 2004) recorded `python.exe` committing 62.9 GB, which took the
+desktop down with the kernel. Every join and uniqueness check in both
+notebooks is on `ROW_KEY = (impression_id, user_id)`, which is unique on
+every population (13,536,710 of 13,536,710 here). The prediction file still
+carries 200,000 lines with id `0`, in `behaviors.parquet` order, exactly as
+A1's accepted submissions did — Codabench matches those by position.
+
+### 6.3 Aligning a 206M-row feature table with Stage-1 scores without a join
+
+The re-ranker needs the feature table and the Stage-1 scores side by side
+per candidate. At A2 Q2's evaluation scale (2.4M rows) that was an inner
+join; at 206M rows it is not done at all. Both notebooks instead produce
+their rows in one deterministic order and align by position:
+
+1. `reranker.write_user_sorted_source` writes the population's behaviors
+   ordered by `(user_id, impression_id)`. A plain
+   `sort(...).sink_parquet(...)` peaked at 10.1 GB on this 15.7 GB machine;
+   even a filter-per-bucket rewrite peaked at 6.2 GB, because polars'
+   parquet reader materializes the whole file to evaluate a string
+   predicate no row-group statistic can prune. The function is therefore an
+   external range sort: the distinct `user_id`s are sorted once and cut into
+   16 contiguous key ranges; the file is read in 16,384-row batches
+   (`ebnerd_testset`'s last two row groups hold the beyond-accuracy rows and
+   are 763 MB of Arrow each, against 44 MB for the others), each batch split
+   by range into one parquet writer per bucket; each bucket is sorted in
+   memory and appended into the final file through a single writer. 59 s
+   and a 2.55 GB peak on 13,536,710 rows, row-identical to the whole-file
+   sort. Because the buckets partition the key space in order, the output
+   is globally sorted and depends on nothing but the data, so the two
+   notebooks build it independently and get the same file.
+2. `feature_engineering.ipynb` walks that order, so the feature table is
+   user-sorted with each impression's candidates contiguous in position
+   order (asserted per batch by the notebook: 13,536,710 runs of
+   `ROW_KEY` for 13,536,710 impressions).
+3. `reranker_submission.ipynb` rebuilds the sorted source (~1 min), takes
+   per-impression candidate counts from it, and slices the feature table at
+   the implied row offsets — 200,000 impressions per chunk. Every chunk
+   asserts that the feature slice and the source slice list the same
+   impressions, users and candidates in the same order before any score is
+   attached.
+
+The user-sorted order also serves the Stage-1 pass: the BM25 adapter's
+one-entry cache computes one corpus-wide `get_scores` per user rather than
+per impression (~17 impressions per user on `ebnerd_testset`), which is
+the difference between the ~4,300 impressions/s measured here and the ~430
+of the evaluation pass in A2 Q2 §9, whose sample was not user-contiguous.
+
+The session-feature attach inside the feature build is the other place
+polars' join direction mattered: polars builds the hash table on the
+*right* side of a left join, so `slice.join(session_table, how="left")`
+hashed the 13.5M-row session table on a composite string key per chunk
+(>6 GB, measured under a watchdog). It is now a semi-join with the 200K
+slice on the right, which cuts the session table down to the chunk's rows
+in 0.3 s and under 1 GB, followed by a 200K × 200K left join.
+
+### 6.4 Measured runs (this machine, 15.7 GB RAM)
+
+| stage | `mind_large_test` | `ebnerd_testset` |
+|---|---|---|
+| feature build wall-clock | 14.8 min | 230.1 min |
+| feature build throughput | 2,664 imp/s | 981 imp/s |
+| Stage-1 + re-rank wall-clock | 63.5 min | 51.8 min |
+| Stage-1 + re-rank throughput | 622 imp/s | 4,356 imp/s |
+| feature-build kernel resident | ~5 GB | 10.4–12.8 GB |
+| impressions with a non-constant re-ranker score | 99.80% | 99.99% |
+| submission | `mind_large_test_reranker_predictions.zip`, 2,370,727 lines | `ebnerd_testset_reranker_predictions.zip`, 13,536,710 lines |
+
+The EB-NeRD feature build runs at the same resident envelope the
+`ebnerd_large` build did (A2 Q1 §9); the throughput gap between the two
+populations is the same data fact as there (EB-NeRD's 136-item mean
+history against MIND's 21.7). The test cells of that notebook were rewritten
+to stream the table one parquet batch at a time: `pl.all().null_count()`
+and a semi-join to pull 200 sample impressions both materialized the 206M-row
+table under the in-memory engine, and each produced another 60 GB commit
+on top of the ~10 GB the lookups hold.
+
+Every zip is checked line by line before it is reported: exactly the
+expected member name, one line per row of `behaviors.parquet` in file
+order, the impression id and candidate count of every line equal to that
+row's, ranks a valid permutation, LF line endings. As a plausibility check
+independent of the notebook, the MIND re-ranker file agrees with A1's
+embedding-baseline file on the top-ranked candidate for 43.6% of
+impressions and is an identical permutation for 8.0% — a different
+ranking of the same candidate lists, not a copy (embedding_score carries
+12.5% of the MIND booster's gain).
+
+Leaderboard screenshots are in the design note (Q5 / Leaderboard
+Submissions).

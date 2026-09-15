@@ -305,6 +305,51 @@ incident with what the re-ranking and serving stages specifically add.}
 \section{Leaderboard Submissions}
 \label{sec:leaderboard}
 
-\todo{Screenshots from both Codabench competitions.}
+% Q5 Part B MEASURED (SPEC.md A2 Q5 #6). benchmarks/verify_a2q5_claims.py
+% submissions reprints every number here from the artifacts.
+Both blind populations were scored with the full two-stage pipeline on the
+same machine as every other measurement in this note: Stage-1 BM25 and
+embedding scores over each impression's in-view list, the Q1 behavioural
+features, and the Q2 LightGBM re-ranker, written in the formats A1's
+submissions established. Two facts about the blind sets shaped the
+implementation. They carry no click labels, so the popularity basis is the
+training dataset's lookup re-keyed into the population's article namespace
+(MINDlarge\_test's ids differ from \code{mind\_large}'s; EB-NeRD's are shared),
+and \code{clicks\_earlier\_in\_session} --- a feature a live system would have
+--- is imputed with its modal training value, which is prediction-identical to
+leaving it missing for a feature LightGBM never saw missing. And the EB-NeRD
+test set's 200{,}000 beyond-accuracy rows all share the sentinel
+\code{impression\_id} 0, so a session-feature join keyed on it alone became a
+$200\text{k}\times200\text{k}$ self-product that committed 62.9\,GB and took
+the desktop down; every join is on \code{(impression\_id, user\_id)}.
+
+The two scales are 205.9\,M and 93.1\,M candidate rows. Rather than join the
+feature table to the Stage-1 scores, both notebooks produce their rows in one
+deterministic \code{(user\_id, impression\_id)} order and align 200{,}000-impression
+chunks by position, asserting per chunk that both sides list the same
+impressions and candidates. Producing that order is itself the optimization
+worth recording: a plain polars sort of the 13.5\,M-row EB-NeRD behaviors
+peaked at 10.1\,GB on this 15.7\,GB machine, so it is an external range sort
+(16 key-range buckets, row-group-batched reads, one writer per bucket) at a
+2.55\,GB peak, row-identical to the whole-file sort. The user-contiguous order
+is also what lets the BM25 adapter's one-entry cache score each user's
+corpus once rather than per impression: Stage-1 plus re-ranking ran at
+4{,}356 impressions/s on EB-NeRD (51.8\,min for 13{,}536{,}710 impressions)
+against the ${\sim}430$/s of the non-contiguous evaluation sample in Q2.
+Feature building took 230\,min (980/s) and 15\,min (2{,}664/s); the EB-NeRD
+build held 10.4--12.8\,GB resident, the same envelope as the
+\code{ebnerd\_large} build in Q1.
+
+Each zip was checked line by line against \code{behaviors.parquet} (one line
+per row in file order, matching id and candidate count, a valid permutation)
+and, independently of the notebook, against A1's embedding-baseline file for
+the same population: the re-ranker picks the same top candidate as the
+embedding baseline for 43.6\% of MIND impressions and 24.2\% of EB-NeRD's,
+with 8.0\% and 0.5\% identical permutations --- a different ranking of the
+same candidate lists, in proportion to how much of each booster's gain the
+embedding score carries (12.5\% and 0.1\%).
+
+\todo{Screenshots from both Codabench competitions, with the two-stage
+pipeline's score next to A1's BM25/embedding entries.}
 
 \end{document}

@@ -1092,3 +1092,42 @@ every memory incident in the project; and calling A1's offline `batched_top_k`
 per request re-normalizes the corpus each time and would have shown the system
 breaching a 100 ms SLA at 1× — measured deliberately, as the cost of reusing an
 offline function as a serving function.
+
+### "shambhavi said that she has access to data/processed and the files inside them. That does mean she has access to the processed files right?" → "it will take around 20 h total then? i want to run it on my device only"
+
+Where Q5's leaderboard submissions would run. `data/` is gitignored, so
+"has `data/processed`" only meant what her Q3 needed (`ebnerd_large`,
+`mind_large`); Part B needs the two converted blind populations
+(`ebnerd_testset`, `mind_large_test`) and MIND's Kaggle-embedded test-only
+articles, which came from separate downloads in A1 and existed on this machine
+only. The user's 20 h figure came from my own earlier estimate, which had used
+the evaluation-path Stage-1 rate (430 impressions/s); the rates actually
+measured in `build_progress.log` for the same shapes of work (A1's submission
+runs at ~3,300/s user-sorted, Q1's feature build at ~920/s) put it at ~8.5 h,
+sequential.
+
+The decision to run here forced one piece of engineering that the design
+note records: the BM25 adapter's one-entry cache is what makes Stage-1 8x
+faster, it needs impressions in user order, and a plain
+`sort().sink_parquet()` of the 13.5M-row `ebnerd_testset` behaviors peaked at
+10.1 GB on this 15.7 GB machine. `reranker.write_user_sorted_source` is the
+external range sort that replaced it (row-group-batched reads, one parquet
+writer per key-range bucket, buckets sorted in memory and appended): 2.55 GB
+peak, output row-identical to the whole-file sort. Because the order is a
+deterministic function of the data, `feature_engineering.ipynb` and
+`reranker_submission.ipynb` build it independently and align their chunks by
+position, and the 200M-row feature-table join that would otherwise have been
+needed never happens.
+
+What running it here then surfaced, in order: the EB-NeRD test set's
+200,000 beyond-accuracy rows share `impression_id` 0 (A1 had recorded this
+twice), so a per-chunk join keyed on it alone became a 200k x 200k
+self-product — a 62.9 GB commit that froze the desktop ("the vscode window
+became unresponsive, fix it"); every join moved to `(impression_id,
+user_id)`. Then polars' join direction: it hashes the right-hand side of a
+left join, so joining a 200k slice against the 13.5M-row session table
+hashed the big side — replaced by a semi-join with the slice on the right.
+Then the notebook's own test cells materializing the 206M-row table under
+the in-memory engine (two more 60 GB commits) — rewritten to stream parquet
+batches. Each was reproduced under a memory watchdog before the fix went in;
+SPEC.md A2 Q5 §6.2-6.4 records them with the measured peaks.

@@ -807,6 +807,53 @@ median 239 h old vs 3.1 h for tail; the re-ranker ranks them a median 7th of 11)
 uv run python benchmarks/verify_a2q5_claims.py head-diagnostic
 ```
 
+## Codabench submissions for the two-stage pipeline (Assignment 2, Q5)
+
+Two steps per blind population, one population per kernel. First the
+behavioural features (the same notebook as A2 Q1; the blind sets have no
+`article_ids_clicked`, so `clicked`/`clicks_earlier_in_session` are null and
+the popularity basis comes from the training dataset — `SPEC.md` A2 Q5 §6):
+
+```bash
+FEATURE_DATASETS=mind_large_test uv run python feature_engineering.py
+FEATURE_DATASETS=ebnerd_testset  uv run python feature_engineering.py
+```
+
+Then Stage-1 scoring + re-ranking + the zip, via
+[`src/reranker_submission.ipynb`](src/reranker_submission.ipynb):
+
+```bash
+SUBMISSION_DATASETS=mind_large_test uv run python reranker_submission.py
+SUBMISSION_DATASETS=ebnerd_testset  uv run python reranker_submission.py
+```
+
+(PowerShell: `$env:SUBMISSION_DATASETS = "mind_large_test"; uv run python reranker_submission.py`)
+
+Outputs `submissions/mind_large_test/mind_large_test_reranker_predictions.zip`
+(MIND, Codabench 13967) and
+`submissions/ebnerd_testset/ebnerd_testset_reranker_predictions.zip` (RecSys
+2024, Codabench 2469), in the formats A1's submission notebooks established.
+Requires `data/processed/{ebnerd_testset,mind_large_test}/` from A1 Q5 and the
+Kaggle-trained `reranker_model_*.txt` + metadata in
+`data/processed/{ebnerd_large,mind_large}/`. Both notebooks are chunked and
+checkpointed; a rerun resumes. The `ebnerd_testset` feature build holds
+10.4-12.8 GB resident for ~4 hours on this 15.7 GB machine (`SPEC.md` A2 Q5
+§6.4) - run it alone. The notebook's test cells verify every structural claim
+in `SPEC.md` A2 Q5 §6 as they run (chunk alignment key-for-key, NaN/0
+prediction identity for the imputed feature, one line per impression in
+`behaviors.parquet` order, valid rank permutations).
+
+### Verifying this section's numeric claims
+
+Row and impression counts, per-stage wall-clock and throughput (from
+`build_progress.log`), a line-by-line check of each zip against
+`behaviors.parquet`, and the share of impressions with a non-constant
+re-ranker score - every number in `SPEC.md` A2 Q5 §6.4:
+
+```bash
+uv run python benchmarks/verify_a2q5_claims.py submissions
+```
+
 ## Dataset location
 
 Raw datasets are gitignored and must be placed at the repo root before running anything,

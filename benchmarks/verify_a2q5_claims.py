@@ -3,6 +3,8 @@ slices, bootstrap CIs) for the two-stage pipeline, read from
 data/processed/{dataset}/reranker_eval_metrics.json.
 
 Usage: uv run python benchmarks/verify_a2q5_claims.py [dataset ...]
+       uv run python benchmarks/verify_a2q5_claims.py head-diagnostic [dataset] [split]
+       uv run python benchmarks/verify_a2q5_claims.py submissions [population ...]
 
 Cross-check: A1's eval_metrics.json holds ILD and novelty for the bm25 and
 embedding baselines over the FULL val/test populations. The same two methods
@@ -132,9 +134,101 @@ def head_diagnostic(dataset: str = "ebnerd_large", split: str = "test") -> None:
     print()
 
 
+def submissions(populations=("mind_large_test", "ebnerd_testset")) -> int:
+    """SPEC.md A2 Q5 #6: the two leaderboard submission files and the runs
+    that produced them -- row/impression counts, wall-clock per stage from
+    build_progress.log, line-by-line agreement with behaviors.parquet order,
+    and the share of impressions with a non-constant re-ranker score."""
+    import re
+    import zipfile
+    from datetime import datetime
+
+    import polars as pl
+
+    sys.path.insert(0, str(ROOT / "src"))
+    from cs4406m26_assignment1c1.reranker import SUBMISSION_POPULATIONS
+
+    log = (ROOT / "build_progress.log").read_text(encoding="utf-8").splitlines()
+
+    def ts(line):
+        return datetime.fromisoformat(line[1:line.index("]")])
+
+    def last_span(start_pat, end_pat):
+        """Wall-clock between the LAST matching end line and the last
+        matching start line before it (an earlier crashed attempt is
+        superseded by the completed one)."""
+        ends = [i for i, l in enumerate(log) if re.search(end_pat, l)]
+        if not ends:
+            return None
+        e = ends[-1]
+        starts = [i for i, l in enumerate(log[:e]) if re.search(start_pat, l)]
+        return (ts(log[e]) - ts(log[starts[-1]])).total_seconds() / 60 if starts else None
+
+    failures = 0
+    for pop in populations:
+        cfg = SUBMISSION_POPULATIONS[pop]
+        meta_path = DATA / pop / "feature_metrics.json"
+        zip_path = ROOT / "submissions" / pop / f"{pop}_reranker_predictions.zip"
+        ranks_path = DATA / "_submission_checkpoints" / pop / "reranker_ranks.parquet"
+        if not (meta_path.exists() and zip_path.exists()):
+            missing = meta_path.name if not meta_path.exists() else zip_path.name
+            print(f"== {pop}: missing {missing}\n")
+            failures += 1
+            continue
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        n_imp = meta["n_impressions_by_split"]["test"]
+        print(f"== {pop}  (trained on {meta['train_dataset']}, catalog {meta['catalog_dataset']}, row order: {meta['row_order']})")
+        print(f"  feature table: {meta['n_rows']:,} rows over {n_imp:,} impressions "
+              f"({meta['n_rows'] / n_imp:.2f} candidates/impression); has_click_labels={meta['has_click_labels']}")
+        fe_min = last_span(rf"feature_engineering started .*'{pop}'", rf"{pop}: reranker_features\.parquet \+ feature_metrics\.json written")
+        sub_min = last_span(rf"reranker_submission started \(datasets=\['{pop}'\]\)", rf"reranker_submission:   {pop}: all \d+ chunks merged")
+        line = f"  wall-clock: feature build {fe_min:.1f} min" if fe_min else "  wall-clock: feature build n/a"
+        if sub_min:
+            line += f", stage-1 + re-rank {sub_min:.1f} min"
+        print(line)
+        if fe_min:
+            line = f"  throughput: features {n_imp / (fe_min * 60):,.0f} imp/s"
+            if sub_min:
+                line += f", stage-1 + re-rank {n_imp / (sub_min * 60):,.0f} imp/s"
+            print(line)
+
+        beh = pl.scan_parquet(DATA / pop / "behaviors.parquet").select(
+            "impression_id", pl.col("article_ids_inview").list.len().alias("n")).collect()
+        ids = beh["impression_id"].to_list()
+        lens = beh["n"].to_list()
+        if cfg["strip_impression_prefix"]:
+            ids = [i.rsplit("_", 1)[-1] for i in ids]
+        n = 0
+        n_sentinel = 0
+        with zipfile.ZipFile(zip_path) as zf:
+            assert zf.namelist() == [cfg["prediction_filename"]], zf.namelist()
+            with zf.open(cfg["prediction_filename"]) as fh:
+                for raw in fh:
+                    iid, ranks = raw.decode("utf-8").rstrip("\n").split(" ", 1)
+                    assert iid == ids[n], (pop, n, iid, ids[n])
+                    r = ranks.strip("[]").split(",")
+                    assert len(r) == lens[n], (pop, n, len(r), lens[n])
+                    if n % 1009 == 0 or len(r) > 100:
+                        assert sorted(map(int, r)) == list(range(1, len(r) + 1))
+                    n_sentinel += iid == "0"
+                    n += 1
+        assert n == len(ids) == n_imp, (pop, n, len(ids), n_imp)
+        line = f"  {zip_path.name}: {n:,} lines in behaviors order, lengths match, permutations valid"
+        if n_sentinel:
+            line += f"; {n_sentinel:,} beyond-accuracy lines (impression_id 0)"
+        print(line)
+        if ranks_path.exists():
+            share = pl.scan_parquet(ranks_path).select((pl.col("score_range") > 0).mean()).collect().item()
+            print(f"  share of impressions with a non-constant re-ranker score: {share:.4f}")
+        print()
+    return 1 if failures else 0
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     if args and args[0] == "head-diagnostic":
         head_diagnostic(*args[1:])
         raise SystemExit(0)
+    if args and args[0] == "submissions":
+        raise SystemExit(submissions(tuple(args[1:])) if args[1:] else submissions())
     raise SystemExit(main(args or ["ebnerd_large", "mind_large"]))
