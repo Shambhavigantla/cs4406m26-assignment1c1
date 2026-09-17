@@ -49,3 +49,6 @@ artifacts/
 *.onnx
 *.h5
 reranker_model*.txt
+
+# Extra work
+extras/

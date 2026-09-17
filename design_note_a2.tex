@@ -1,15 +1,12 @@
 % =====================================================================
 % CS4.406 IRE - Assignment 2 Design Note
 %
-% STATUS: SKELETON. Section bodies are placeholders except where marked
-% otherwise. Layout is deliberately NOT A1's: A2's brief gives a 6-page
-% *target* rather than a hard cap, so this uses real 1in margins, 11pt,
-% and default LaTeX spacing instead of the compressed titlespacing /
-% parskip=1.5pt / margin=0.5in that A1's 4-page cap forced.
-%
 % House style: prose by default. Bullets only for genuinely list-like
-% content (a changelog, a set of dataset differences) - not as a device
-% for breaking up long text.
+% content (a changelog) - not as a device for breaking up long text.
+% No em dashes; no "clause: clause" constructions in the prose.
+%
+% Build with TWO pdflatex passes so \ref resolves (a single pass leaves
+% "??" everywhere).
 % =====================================================================
 
 \documentclass[11pt]{article}
@@ -25,12 +22,8 @@
     \colorbox{gray!40}{\texttt{#1}}%
 }
 
-% A colour switch inside a group, not \textcolor{..}{#1}: \textcolor's argument
-% is not \long, so a placeholder spanning paragraphs would fail to compile.
-\newcommand{\todo}[1]{{\color{red}[TODO: #1]}}
-
 \title{IRE Assignment 2 Design Note\\\large Learning from Click-Logs on EB-NeRD and MIND}
-\author{Iman Kalyan Chakraborty - 2026801003}
+\author{Iman Kalyan Chakraborty - 2026801003 \and Shambhavi Gantla - 2026801014}
 \date{\today}
 
 \begin{document}
@@ -43,10 +36,22 @@
 \section{Introduction}
 \label{sec:intro}
 
-\todo{What A2 adds on top of A1's retrieval pipeline: behavioural features from
-the click-logs, a trained two-stage re-ranker, a reproduced NRMS baseline with a
-paired-bootstrap ablation, and a serving/scale analysis. Both datasets, large
-tracks, both Codabench leaderboards.}
+Assignment 1 built retrieval over a unified schema for EB-NeRD and MIND, using
+a from-scratch BM25 index and a frozen-embedding semantic retriever, but it
+learned nothing from the logs, because every score came from a fixed
+similarity formula. This assignment adds the behavioural half. Fifteen
+features are engineered from the click-logs (Section~\ref{sec:features}) and a
+LightGBM re-ranker is trained over them on top of A1's retrieval scores
+(Section~\ref{sec:reranker}). Separately, the official \code{NRMSDocVec} baseline is
+reproduced from the authors' own code and improved with one principled change,
+with a three-arm ablation and paired bootstrap intervals
+(Section~\ref{sec:baseline}), and the served system is measured rather than
+described (Section~\ref{sec:serving}). Everything runs at both datasets' large scale
+on one 15.7\,GB desktop, with GPU-bound fitting offloaded to Kaggle. The
+re-ranker adds $+0.0979$ AUC over the best Stage-1 baseline on EB-NeRD and
+$+0.0155$ on MIND, and Section~\ref{sec:dataset-gap} argues that the gap between
+those two numbers, rather than their size, is the most informative thing
+measured here.
 
 \section{Design}
 \label{sec:design}
@@ -54,85 +59,128 @@ tracks, both Codabench leaderboards.}
 \subsection{Click-History and Session Features (Q1)}
 \label{sec:features}
 
-\todo{The fifteen features and where each comes from; recency weighting as real
-elapsed time on EB-NeRD versus an ordinal proxy on MIND; the five columns MIND
-never had; the behaviour-window boundary and why the current impression's own
-read time and scroll depth are deliberately excluded.}
+The feature set is fifteen columns, one row per (impression, candidate) pair.
+Five describe the user's history, namely click count, recency-weighted
+category affinity, cosine similarity to a recency-weighted pool of history
+embeddings, and recency-weighted dwell time and scroll depth. Three describe
+the impression context, namely the candidate's position in the in-view list
+and how many clicks and impressions the user has already had in this session.
+Three describe the article itself, namely add-one-smoothed training
+popularity, age at impression time, and whether its category appears in the
+user's history. The remaining four are the Stage-1 retrieval signals discussed
+in Section~\ref{sec:reranker}.
+
+Recency weighting is $w_i = \exp(-\ln 2 \cdot \Delta_i / H)$, but $\Delta_i$
+means different things on the two datasets and the difference is recorded in
+the artifacts rather than hidden. On EB-NeRD it is real elapsed time in hours
+with a 72-hour half-life. On MIND it is rank from the most recent click with a
+five-click half-life, because MIND has no per-click timestamps anywhere in its
+raw data, and the metrics file marks this basis as an ordinal proxy so that no
+downstream reader can mistake it for elapsed time. The weights are recomputed
+per impression rather than cached per user, because they depend on that
+impression's own timestamp, and the same history decays differently when the
+user returns two days later. That is $O(\text{history length})$ work per
+impression and the dominant cost of the build, which takes 4h54m for
+190,850,352 rows on \code{ebnerd\_large}.
+
+Five columns are null for every MIND row, being both dwell-time features, both
+session features, and freshness, because those signals do not exist in MIND's
+logs at all. They are carried as nulls rather than zero-filled, since LightGBM
+routes a missing value at each split, so one feature set serves both datasets
+without a sentinel value the trees could read as a measurement, and
+Section~\ref{sec:dataset-gap} shows that this nullity is what separates the two
+datasets' results. The behaviour-window boundary is enforced and then tested.
+A user's history is a pre-collection-window snapshot by construction, the
+leakage test asserts that every consumed timestamp is strictly before the
+impression time, and a stronger check truncates one real user's history to a
+prefix, recomputes three features by hand from that prefix alone, and requires
+the notebook's own output to match. Deliberately excluded, and this is Q9's
+substance, are the current impression's own read time and scroll depth. They
+are strongly predictive, but they are the outcome of the impression being
+scored rather than a signal available before it.
 
 \subsection{The Re-Ranker (Q2)}
 \label{sec:reranker}
 
-\todo{Option A (GBDT/LightGBM) over Option B (small neural ranker), and why:
-NRMS is Q3's baseline, so choosing the neural ranker here would have collapsed
-the improvement and the thing it is measured against into one model. Training
-hosted on Kaggle, inference local. The learning curve that settled the 400k
-training cap.}
+Stage 2 is Option A, a LightGBM GBDT, and the decisive argument is structural.
+Q3 requires reproducing a neural baseline and beating it, so had Stage 2 also
+been a small neural ranker, the improvement under test and the thing it is
+measured against would have been the same class of model on the same signal,
+and a gain would have been uninterpretable. The feature set argues for trees
+independently, since fifteen heterogeneous columns on different scales, a
+third of them absent on one dataset, is exactly the shape where trees need no
+normalisation, imputation or embedding layer. Fitting is hosted on Kaggle and
+inference is local, the same split A1 used for embeddings and for the same
+reason, and what comes back is a 374\,KB text file.
 
-\subsubsection*{Candidate set: why re-ranking operates on the in-view set}
+The training size was measured rather than asserted. The same configuration
+fitted on \emph{nested} subsamples of 100k, 200k and 400k impressions, nested
+so that successive points differ only by added data, gives validation AUC of
+0.6701, 0.6698 and 0.6655 on \code{ebnerd\_large} and 0.6183, 0.6176 and
+0.6158 on \code{mind\_large}. The curve is flat to slightly declining on both,
+so 400,000 impressions is past the point where more data helps. Both models
+also stop at 53 and 45 trees against a 2,000-round budget, which is consistent
+with a feature set where a few columns carry nearly all the signal.
+
+\subsubsection*{Why re-ranking operates on the in-view set}
 \label{sec:candidate-fork}
 
 % ---------------------------------------------------------------------
-% LOAD-BEARING PARAGRAPH - DO NOT DROP WHEN THIS SECTION IS WRITTEN OUT.
-% This is the justification for departing from the literal wording of Q2.1
-% ("use Assignment 1's candidate generator to retrieve top-K candidates").
-% Everything else in this subsection is scaffolding around it: the recall@200
-% ceiling, the Codabench format constraint, and the measured zero split gain
-% of the two membership features are the *evidence*, but this sentence is the
-% *claim* they support - that the two-stage structure the assignment asks for
-% is genuinely present, just wired through the retrieval scores rather than
-% through a precomputed top-200 list.
+% LOAD-BEARING PARAGRAPH (the one beginning "So Stage 1 genuinely feeds
+% Stage 2") - DO NOT DROP. It is the justification for departing from the
+% literal wording of Q2.1. Everything above it is the evidence.
 % ---------------------------------------------------------------------
-So Stage 1 genuinely feeds Stage 2 --- just through ``how well does BM25 score
+Q2 asks for A1's candidate generator to retrieve top-$K$ candidates which the
+re-ranker then re-orders, and this pipeline departs from that wiring. A1's
+top-200 is scored against the whole catalogue of 125,541 EB-NeRD or 104,151
+MIND articles, whereas an impression's in-view set is what the publisher
+actually showed the user, about twelve articles on EB-NeRD and thirty-seven on
+MIND. The two sets barely intersect, since recall@200 against the clicked
+article is only 0.2 to 3\%, so a second stage restricted to our top-200 would
+be re-ordering a list that usually does not contain the answer. The constraint
+is also external, because both leaderboards require the submission to be a
+permutation of the given in-view set, which makes a ranking of our own top-200
+unsubmittable. The top-200 lists are therefore used as evidence instead, as
+two membership flags per candidate that overlap the in-view set 2.4 to 4.3
+times above chance and carry exactly zero split gain in both trained models.
+This fork was identified during A1 (\code{SPEC.md}, A1 Q4, first section) rather than
+retrofitted here.
+
+So Stage 1 genuinely feeds Stage 2, just through ``how well does BM25 score
 this article for this user'' rather than ``is this article in the user's global
 top-200''. That is the same \code{score\_inview} adapter A1 built, reused
 unchanged, which is why the two-stage framing still holds.
 
-\todo{Build the argument that leads into the paragraph above: the top-200 is
-scored against the whole catalogue (125,541 / 104,151 articles) while re-ranking
-must operate on \code{article\_ids\_inview} (${\sim}12$ EB-NeRD, ${\sim}37$
-MIND); recall@200 of 0.2--3\% caps any metric the second stage could produce;
-both Codabench leaderboards require a permutation of the in-view set, so a
-ranking of our own top-200 is not submittable at all; and the two membership
-features that do encode top-200 overlap carry exactly zero split gain on both
-datasets, at 2.4--4.3$\times$ chance overlap. Note this fork was identified and
-documented during A1 (SPEC.md Q4 \S1), not retrofitted for A2.}
-
 \subsection{Baseline Reproduced, Then Beaten (Q3)}
 \label{sec:baseline}
 
-% ---------------------------------------------------------------------
-% DESIGN DECISIONS ARE SETTLED (SPEC.md A2 Q3); ONLY THE MEASURED NUMBERS
-% ARE OUTSTANDING. Keep the four points below when writing this out.
-% ---------------------------------------------------------------------
 The baseline is \code{NRMSDocVec} from \code{ebanalyse/ebnerd-benchmark},
-imported from a clone pinned at one commit and run unmodified --- the notebook
-asserts the checked-out revision and a clean working tree, so ``reproduction''
-means their code rather than a reimplementation of their paper. It runs on both
-datasets through the same code path, because A1's unified schema and A1 Q3's
-document vectors are exactly the input \code{NRMSDocVec} expects; the
-alternative of pairing it with \code{recommenders-team}'s NRMS-on-MIND would
-have meant two implementations, a GloVe-tokenised title pipeline for MIND
-alone, and MIND numbers not comparable to EB-NeRD's.
+imported from a clone pinned at one commit and run unmodified, and the
+notebook asserts the checked-out revision and a clean working tree, so
+reproduction means the authors' code rather than a reimplementation of their
+paper. It runs on both datasets through the same code path, because A1's
+unified schema and document vectors are exactly the input \code{NRMSDocVec}
+expects. Pairing it with \code{recommenders-team}'s NRMS-on-MIND instead would
+have meant maintaining two implementations and reporting MIND numbers not
+comparable to EB-NeRD's.
 
-The improvement is one term. \code{AttLayer2} pools a user's history
-order-blind and time-blind; the variant adds a recency log-weight to the
-attention exponent, so recency multiplies the learned attention rather than
-replacing it, with real elapsed time on EB-NeRD and the ordinal proxy on MIND
---- A2 Q1's own two bases, not a third notion of recency. It adds no
-parameters, so all three variants have identical capacity, and it keeps the
-user vector candidate-independent, which is what makes the scoring shortcut in
-Section~\ref{sec:optimizations} possible.
+The improvement is one term. \code{AttLayer2} pools a user's history in a way
+that is blind to both order and time, and the variant adds a recency
+log-weight to the attention exponent, so that recency multiplies the learned
+attention rather than replacing it, using real elapsed time on EB-NeRD and the
+ordinal proxy on MIND. Those are A2 Q1's own two bases rather than a third
+notion of recency. It adds no parameters, so all three variants have identical
+capacity, and it keeps the user vector candidate-independent, which is what
+makes the scoring shortcut in Section~\ref{sec:optimizations} possible.
 
 The ablation has three arms rather than two, because the recency layer also
-masks the zero-padded history slots the baseline attends over. That is a real
-fix and not the recency signal, so \code{masked\_uniform} --- the same
-architecture fed all-zero log-weights --- sits between them, and the two paired
-intervals separate the mask from the signal. The three point estimates
-decompose exactly, which the notebook asserts.
-
-The result splits by dataset, and the three-arm ablation is what makes that
-readable. Every variant carries an identical 1,304,720 parameters, so none of
-what follows is capacity.
+masks the zero-padded history slots the baseline attends over, and that is a
+real fix rather than the recency signal. The middle arm,
+\code{masked\_uniform}, is the same architecture fed all-zero log-weights, so
+the two paired intervals separate the mask from the signal, and the three
+point estimates decompose exactly, which the notebook asserts. All three
+variants carry an identical 1,304,720 parameters, so nothing below is
+capacity.
 
 \begin{table}[h]
 \centering
@@ -150,92 +198,110 @@ dataset & split & baseline & masked\_uniform & recency \\
 impressions across variants.}
 \end{table}
 
-On MIND the improvement is confirmed: all four metrics on both splits give a
-paired 95\% interval excluding zero and positive, $\Delta$AUC $+0.0080$
-$[+0.0071, +0.0090]$ on val and $+0.0042$ $[+0.0033, +0.0051]$ on test. On
-EB-NeRD it is not: val agrees ($+0.0056$ $[+0.0046, +0.0066]$) but test does
-not, with AUC and nDCG@5 indistinguishable from zero and MRR and nDCG@10
-significantly negative. Reported as such --- the assignment's bar is met for
-MIND on both splits and for EB-NeRD on val only.
+On MIND the improvement is confirmed, since all four metrics on both splits
+give a paired 95\% interval that excludes zero and is positive, with
+$\Delta$AUC of $+0.0080$ $[+0.0071, +0.0090]$ on val and $+0.0042$ $[+0.0033,
++0.0051]$ on test. On EB-NeRD it is not, because val agrees at $+0.0056$
+$[+0.0046, +0.0066]$ but test does not, with AUC and nDCG@5 indistinguishable
+from zero and MRR and nDCG@10 significantly negative. It is reported as such,
+so the assignment's bar is met for MIND on both splits and for EB-NeRD on val
+only.
 
 What the middle variant buys is the reason why. Isolating recency from the
 padding mask it also introduces, the two datasets attribute the same headline
-change to opposite causes: on MIND masking does nothing (val) or hurts (test)
-and the ordinal recency prior is the whole effect ($+0.0073$ and $+0.0088$);
-on EB-NeRD the val gain \emph{is} the mask ($+0.0072$) and the elapsed-time
-recency prior removes $0.0016$ of it. A two-arm experiment would have reported
-EB-NeRD's val result as a confirmed recency improvement, and been wrong about
-the mechanism.
+change to opposite causes. On MIND the masking does nothing on val and hurts
+on test, so the ordinal recency prior is the whole effect, worth $+0.0073$ and
+$+0.0088$. On EB-NeRD the val gain \emph{is} the mask, worth $+0.0072$, and
+the elapsed-time recency prior removes $0.0016$ of it. A two-arm experiment
+would have reported EB-NeRD's val result as a confirmed recency improvement
+and been wrong about the mechanism.
 
-\todo{Two things still to write here: where these numbers sit against A2 Q2's
-Stage-1 baselines and re-ranker (they were measured on the same 200,000
-impressions, so the tables are directly comparable), and the early-stopping
-artifact from SPEC.md A2 Q3 \S9 --- EB-NeRD's 07:00 split cutoff leaves the
-authors' last-calendar-day rule only 3.8\% of the training sample to monitor
-on, against MIND's 25.4\%, which is a live alternative explanation for the
-EB-NeRD val/test disagreement and should be stated as one. Figures:
-\code{nrms\_ablation.png}, \code{nrms\_paired\_ci.png}.}
+Against Q2's numbers, measured on the same 200,000 impressions per split and
+therefore directly comparable, the two datasets invert. On \code{mind\_large}
+the improved NRMS reaches test AUC 0.6349 and beats the two-stage re-ranker at
+0.6099, while on \code{ebnerd\_large} it is far behind at 0.5845 against
+0.6490. A neural encoder over title embeddings is the stronger model exactly
+where the behavioural log is thin, which is the same finding
+Section~\ref{sec:dataset-gap} reaches from the other direction.
+
+One alternative explanation for EB-NeRD's val and test disagreement should be
+stated rather than left implicit. The authors' early-stopping rule monitors
+the last calendar day of the training split, and EB-NeRD's 07:00 cutoff leaves
+that rule only 3.8\% of the training sample to monitor on, against MIND's
+25.4\%. A stopping signal computed on a twenty-fifth of the data is a
+plausible cause of a variant that confirms on val and not on test, and it is
+not something the ablation design can separate. The supporting figures are
+\code{nrms\_ablation.png} and \code{nrms\_paired\_ci.png}.
 
 \subsection{Serving and Scale Analysis (Q4)}
 \label{sec:serving}
 
-% ---------------------------------------------------------------------
-% MEASURED (SPEC.md A2 Q4, data/processed/{dataset}/serving_metrics.json).
-% Numbers below are from the final run on this machine (i5-13500, 15.7 GB).
-% Write this section around the three findings; do not re-derive them.
-% ---------------------------------------------------------------------
-\todo{Write out from SPEC.md A2 Q4. Served two-stage path (BM25 + embedding
-over the in-view set, LightGBM re-rank), 1,000 sampled requests after 50
-warm-up: p99 \textbf{6.09 ms} on \code{ebnerd\_large}, \textbf{10.43 ms} on
-\code{mind\_large}, against a 100 ms SLA (16$\times$ / 9.6$\times$ headroom);
-230 / 161 QPS per process; \$0.000051 / \$0.000073 per 1,000 queries at
-\$0.0425/vCPU-h (stated assumption). Resident serving set 0.80 / 0.68 GB, of
-which the embedding matrix and its unit copy are $\sim$90\%; BM25 index 84 / 85
-MB; booster 374 / 320 KB.
+The served path consists of BM25 and embedding scoring over one impression's
+in-view set, feature assembly, and LightGBM inference, and it was timed over
+1,000 sampled requests after 50 warm-up requests on this machine (i5-13500,
+15.7\,GB). Against the brief's 100\,ms example SLA, p99 latency is
+\textbf{6.09\,ms} on \code{ebnerd\_large} and \textbf{10.43\,ms} on
+\code{mind\_large}, which is 16 and 9.6 times of headroom, 230 and 161 queries
+per second per process, and \$0.000051 and \$0.000073 per thousand queries at
+an assumed \$0.0425 per vCPU-hour. The resident serving set is 0.80 and
+0.68\,GB, of which the embedding matrix and its normalised copy are some 90\%,
+while the BM25 index is 84 and 85\,MB and the booster 374 and 320\,KB.
 
-Three findings to carry: (1) \code{bm25\_inview} is 83\% / 88\% of the served
-path because the inverted index scores the whole catalogue to read out a
-dozen documents --- the index choice that made A1's candidate generation fast
-is the one thing holding the served path above a millisecond; a forward index
-would fix it. (2) The offline feature table already exceeds this machine at
-1$\times$ on \code{ebnerd\_large} (27.9 GB vs 15.7 GB) and at 2$\times$ on MIND
---- the measured form of every memory incident in the project, and why Q1/Q2
-stream it. State clearly that this is the offline artifact; a live system
-derives features from history + article metadata, so the timed
-\code{feature\_assembly} (a slice) is a \emph{lower bound}. (3) Calling A1's
-offline \code{batched\_top\_k} per request re-normalizes the corpus each call:
-40$\times$ slower than the serving-shaped matvec, 311 / 274 ms p99, which would
-have shown an SLA breach at 1$\times$ --- measured deliberately as the cost of
-reusing an offline function for serving.
-
-Order of breakage at 10$\times$: feature table (279 / 101 GB) first and already;
-brute-force embedding retrieval second (serving set 8.0 / 6.8 GB, top-200 p99
-81 / 69 ms --- an ANN index becomes a requirement); BM25 corpus-wide top-K third
-and it breaches on MIND (146 ms p99; 37 postings/doc vs EB-NeRD's 22 --- WAND/BMW
-or sharding). The re-ranker does not scale with anything and is the cheapest
-stage in the system. Figure: \code{serving\_benchmark.png} (three panels: served-path
-breakdown, candidate-generation p99 against the SLA, resident memory vs this machine).}
+Three findings matter more than the headline. First, \code{bm25\_inview} is
+83\% and 88\% of the served path, because an inverted index scores the whole
+catalogue to read out a dozen documents, so the index choice that made A1's
+candidate generation fast is the single thing holding the served path above a
+millisecond, and a forward index would remove it. Second, the offline feature
+table already exceeds this machine at 1$\times$ on \code{ebnerd\_large}, at
+27.9\,GB against 15.7\,GB, and at 2$\times$ on MIND. That is the measured form
+of every memory incident in the project and the reason Q1 and Q2 stream it. It
+is an offline artifact, since a live system derives features from history and
+article metadata, so the timed feature assembly is a lower bound. Third,
+calling A1's offline \code{batched\_top\_k} once per request re-normalises the
+corpus on every call, making it 40 times slower than the serving-shaped
+matrix-vector product at 311 and 274\,ms p99, which alone would breach the SLA
+at 1$\times$. That was measured deliberately, as the price of reusing an
+offline function for serving.
 
 \subsection{Code Optimizations}
 \label{sec:optimizations}
 
-\todo{The measured memory work: the Arrow-to-Python materialization class of bug
-found six times over, peak stacking, the streaming join that replaced two eager
-collects, and BM25 determinism via \code{sorted(set(...))}. List format is
-appropriate here - this section is a changelog.}
+The performance work that mattered was memory rather than speed, and one bug
+class recurred six times, namely converting an Arrow column to Python objects
+before reducing it. Each instance was fixed by staying columnar, for instance
+by taking \code{list.to\_array(dim).to\_numpy()} instead of a comprehension
+over \code{to\_list()}, which was worth 3.5\,GB of transient memory on the
+blind EB-NeRD build alone. The others are listed below.
 
-\todo{Q3's scoring shortcut belongs in this changelog too. The
-\code{ebnerd-benchmark} scoring path flattens every (impression, candidate)
-pair into its own row, re-encoding the user's whole 20-click history once per
-candidate; since \code{NRMSDocVec} scores by a dot product of a history-only
-user vector and an article-only news vector, the news encoder can run once over
-the whole catalogue and the user encoder once per impression, removing a factor
-of ${\sim}11.9$ (EB-NeRD) to ${\sim}37$ (MIND) of encoder work per split. The
-notebook checks the shortcut against \code{model.scorer.predict} directly ---
-\code{sigmoid(dot)} within 1e-4, ranking flips counted --- and reports the
-measured speedup. Note also that this is why the improvement was chosen to keep
-the user vector candidate-independent: a candidate-aware encoder would give the
-factor back, offline and at serving time.}
+\begin{itemize}\itemsep2pt
+\item \textbf{Peak stacking.} Releasing the previous dataset's index before
+building the next, rather than assigning over the binding, which keeps both
+alive through the allocation. BM25 vocabulary order uses
+\code{sorted(set(...))} so that builds stay reproducible.
+\item \textbf{Streaming joins.} Two eager \code{collect} calls against a
+164M-row exploded top-200 frame killed the kernel, whereas
+\code{sink\_parquet} over the same plan bounds the peak regardless of how
+large the other side is.
+\item \textbf{Join direction.} Polars builds its hash table on the right side
+of a left join, so joining a 200k-row slice against a 13.5M-row table hashed
+the wrong side, and a semi-join first cuts it to the slice's rows in 0.3\,s.
+\item \textbf{External sort.} A plain sort of the 13.5M-row blind behaviors
+peaked at 10.1\,GB, whereas a range-bucketed external sort reproduces it
+bit-for-bit at 2.55\,GB.
+\end{itemize}
+
+Q3 contributes one more. The \code{ebnerd-benchmark} scoring path flattens
+every (impression, candidate) pair into its own row, re-encoding the user's
+whole twenty-click history once per candidate. Since \code{NRMSDocVec} scores
+by a dot product of a history-only user vector with an article-only news
+vector, the news encoder can run once over the catalogue and the user encoder
+once per impression, removing a factor of roughly 11.9 on EB-NeRD and 37 on
+MIND of encoder work. The notebook validates the shortcut against
+\code{model.scorer.predict} directly, checking that the sigmoid of the dot
+product agrees within 1e-4 with zero ranking flips, rather than assuming the
+algebra. This is also why the Q3 improvement was designed to keep the user
+vector candidate-independent, since a candidate-aware encoder would hand the
+factor back, offline and at serving time alike.
 
 \section{Discussion}
 \label{sec:discussion}
@@ -243,113 +309,142 @@ factor back, offline and at serving time.}
 \subsection{Results}
 \label{sec:results}
 
-\todo{Consolidated table: AUC, MRR, nDCG@5, nDCG@10 before and after re-ranking,
-both datasets, val and test, with bootstrap CIs and the paired CI on each
-difference. Plus the sample-representativeness check against A1's
-full-population baselines.}
+All three methods were scored on one common sample of 200,000 impressions per
+split, which is what makes the differences paired. The sample is not assumed
+to be representative. The two Stage-1 baselines were re-measured on it and
+agree with A1's full-population values to within 0.0008 on every ranking
+metric, and with A1's ILD and novelty inside the sample's own 95\% interval on
+every split.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llcccc}
+\toprule
+dataset & method & AUC & MRR & nDCG@5 & nDCG@10 \\
+\midrule
+\code{ebnerd\_large} & \code{bm25} & 0.5015 & 0.3191 & 0.3495 & 0.4344 \\
+                     & \code{embedding} & 0.5511 & 0.3486 & 0.3867 & 0.4648 \\
+                     & \code{reranker} & \textbf{0.6490} & \textbf{0.4224} & \textbf{0.4722} & \textbf{0.5334} \\
+\midrule
+\code{mind\_large}   & \code{bm25} & 0.5569 & 0.3000 & 0.2760 & 0.3378 \\
+                     & \code{embedding} & 0.5944 & 0.3196 & 0.2975 & 0.3613 \\
+                     & \code{reranker} & \textbf{0.6099} & \textbf{0.3341} & \textbf{0.3140} & \textbf{0.3747} \\
+\bottomrule
+\end{tabular}
+\caption{Before and after re-ranking, test split, 200,000 impressions,
+identical impressions across methods.}
+\end{table}
+
+Every paired interval excludes zero. Against the stronger baseline the
+re-ranker gains $+0.0979$ AUC $[+0.0964, +0.0996]$ on \code{ebnerd\_large}
+test and $+0.0155$ $[+0.0145, +0.0166]$ on \code{mind\_large} test, and
+against BM25 it gains $+0.1475$ and $+0.0530$. The val split agrees in both
+direction and magnitude, at $+0.1066$ and $+0.0057$ against embedding, so the
+effect is not a property of one week of logs.
 
 \subsection{Why the Gain Differs Between the Two Datasets}
 \label{sec:dataset-gap}
 
-\todo{The substantive finding: EB-NeRD gains ${\sim}0.10$ AUC against MIND's
-0.006--0.016, because seven of fifteen features carry zero split gain on MIND
-versus two on EB-NeRD - and the single most informative EB-NeRD feature,
-\code{freshness\_hours} at 48\% of total gain, is one of the five MIND never
-had. Same model, same features, same hyperparameters; the ceiling is set by what
-the log records.}
+The same model, the same fifteen features and the same hyperparameters produce
+$+0.0979$ AUC on EB-NeRD and $+0.0155$ on MIND, and the explanation lies in
+the logs rather than in the modelling. Seven of the fifteen features carry
+zero split gain on \code{mind\_large} against two on \code{ebnerd\_large}, and
+the single most informative EB-NeRD feature, \code{freshness\_hours} at 48\%
+of total gain, is one of the five columns MIND never recorded. MIND's booster
+instead leans on \code{popularity} at 53\% and \code{position\_in\_impression}
+at 21\%, both of which are weak and user-independent signals. The ceiling on
+what a re-ranker can learn is set by what the log records rather than by the
+learner, and on this evidence instrumenting dwell time, sessions and
+publication timestamps would buy more than any change of model.
 
-\subsection{Ablation and Statistical Significance}
+\subsection{Extended Evaluation and Slices}
 \label{sec:ablation}
 
-% ---------------------------------------------------------------------
-% Q5 Part A MEASURED (SPEC.md A2 Q5 #3-#5). Numbers below are from
-% reranker_eval_metrics.json; benchmarks/verify_a2q5_claims.py reprints them.
-% ---------------------------------------------------------------------
-\todo{Write out from SPEC.md A2 Q5. All seven metrics for all three methods on
-the identical 200k-impression sample (test): the re-ranker's ILD is lowest on
-both datasets (\code{ebnerd\_large} 0.781 vs 0.798/0.791; \code{mind\_large}
-0.785 vs 0.854/0.838) and top-10 coverage equal-or-lower, but \textbf{novelty
-goes opposite ways}: lower on MIND (20.10 vs 20.38/20.62, popularity-dominated,
-53\% of gain) and \emph{higher} on EB-NeRD (22.33 vs 21.96/22.14,
-freshness-dominated, 48\% of gain) --- novelty is $-\log_2$ of \emph{train}
-popularity, and fresh articles have no train clicks. Same asymmetry as Q2's
-accuracy gains, now on the beyond-accuracy side. State plainly that ``the
-re-ranker reduces novelty'' would be wrong on one dataset.
+Beyond accuracy the picture is mixed and worth reporting as such. On the test
+split the re-ranker has the lowest intra-list diversity of the three methods
+on both datasets, at 0.781 against 0.798 and 0.791 on EB-NeRD and 0.785
+against 0.854 and 0.838 on MIND, and its top-10 catalogue coverage is equal or
+lower. Novelty, however, moves in opposite directions, falling on MIND to
+20.10 against 20.38 and 20.62 but \emph{rising} on EB-NeRD to 22.33 against
+21.96 and 22.14. The mechanism is the feature importances again, because
+novelty is $-\log_2$ of training popularity, fresh articles have no training
+clicks, and EB-NeRD's ranker is freshness-driven while MIND's is
+popularity-driven. The claim that the re-ranker recommends less novel items
+would be false on one of the two datasets.
 
-Slices: head is tiny on a temporal split (1.5\% of EB-NeRD test; ``head'' is
-defined on train clicks and news decays), so tail $\approx$ overall. The one
-negative result to report, not bury: on EB-NeRD test/head the re-ranker is
-\textbf{below chance} (AUC 0.416 [0.404, 0.427] vs BM25 0.596, n=3{,}032).
-Mechanism measured: clicked head articles are a median 239 h old vs 3.1 h for
-tail (77$\times$); the freshest in-view candidate is 1 h; the re-ranker ranks
-the clicked article a median 7th of 11; 87\% of the time it is older than the
-median candidate. A freshness prior buries the evergreen story the user came
-back for. On val (one day after train, head articles still fresh) the
-re-ranker leads on head, which separates ``wrong about head'' from ``wrong
-about \emph{old}''. Cold-start exists only on MIND (6,016 test impressions):
-both retrieval baselines are exactly 0.5000 (empty query, full tie), the
-re-ranker 0.511 from popularity + position alone --- not solved by anyone.
-
-Representativeness: sampled ILD/novelty for both baselines lie inside the
-sample CI of A1's full-population values on every split (extends Q2 \S7's
-argument to the beyond-accuracy metrics). Then: the Q3 ablation with its
-paired CI, and the Q9 with/without-serving-time-features run.}
+Slices expose one genuine failure. On a temporal split the head is small, at
+1.5\% of EB-NeRD test impressions, since head membership is defined by
+training clicks and news decays, and on that slice the re-ranker is
+\textbf{below chance}, with AUC 0.416 $[0.404, 0.427]$ against BM25's 0.596.
+The mechanism was measured rather than guessed. Clicked head articles are a
+median 239 hours old against 3.1 hours for tail, the freshest in-view
+candidate is typically an hour old, and the re-ranker ranks the clicked
+article a median 7th of 11, so a freshness prior buries the evergreen story
+the user came back for. On val, one day after training, the same model leads
+on head, which separates being wrong about head articles from being wrong
+about \emph{old} articles. Cold-start exists only on MIND, where both
+retrieval baselines score exactly 0.5000 because an empty query is a full tie,
+and the re-ranker reaches 0.511 on popularity and position alone.
 
 \subsection{Where This Breaks at 10x}
 \label{sec:scaling}
 
-\todo{Feature-store joins at scale, brute-force cosine similarity needing a real
-ANN index, ranker-inference batching. Extend A1's genuine memory-exhaustion
-incident with what the re-ranking and serving stages specifically add.}
+The order in which this system breaks at ten times the load is measured rather
+than guessed, and the first component has already broken. The offline feature
+table reaches 279 and 101\,GB at 10$\times$, against 27.9\,GB today on a
+15.7\,GB machine, so it is streamed and chunked precisely because it never
+fit, and at 10$\times$ it would need a columnar store queried per request
+rather than a materialised table. Brute-force embedding retrieval goes second,
+because the serving set reaches 8.0 and 6.8\,GB and corpus-wide top-200 p99
+reaches 81 and 69\,ms, so an approximate index stops being an optimisation and
+becomes a requirement. BM25 corpus-wide top-$K$ goes third and actually
+breaches the SLA on MIND, at 146\,ms p99 with 37 postings per document against
+EB-NeRD's 22, which WAND or sharding would address. The re-ranker never
+breaks, since it scales with the in-view set, which is a property of the
+publisher's page rather than of the corpus, and it is the cheapest stage in
+the system at every scale measured. The supporting figure is
+\code{serving\_benchmark.png}.
 
 \section{Leaderboard Submissions}
 \label{sec:leaderboard}
 
-% Q5 Part B MEASURED (SPEC.md A2 Q5 #6). benchmarks/verify_a2q5_claims.py
-% submissions reprints every number here from the artifacts.
-Both blind populations were scored with the full two-stage pipeline on the
-same machine as every other measurement in this note: Stage-1 BM25 and
-embedding scores over each impression's in-view list, the Q1 behavioural
-features, and the Q2 LightGBM re-ranker, written in the formats A1's
-submissions established. Two facts about the blind sets shaped the
-implementation. They carry no click labels, so the popularity basis is the
-training dataset's lookup re-keyed into the population's article namespace
-(MINDlarge\_test's ids differ from \code{mind\_large}'s; EB-NeRD's are shared),
-and \code{clicks\_earlier\_in\_session} --- a feature a live system would have
---- is imputed with its modal training value, which is prediction-identical to
-leaving it missing for a feature LightGBM never saw missing. And the EB-NeRD
-test set's 200{,}000 beyond-accuracy rows all share the sentinel
-\code{impression\_id} 0, so a session-feature join keyed on it alone became a
-$200\text{k}\times200\text{k}$ self-product that committed 62.9\,GB and took
-the desktop down; every join is on \code{(impression\_id, user\_id)}.
+Both blind populations, being 13,536,710 EB-NeRD and 2,370,727 MIND
+impressions and 205.9\,M and 93.1\,M candidate rows, were scored with the full
+two-stage pipeline. Having no labels, they take their popularity basis from
+the training dataset's lookup re-keyed into their own article namespace. The
+feature table is never joined to the Stage-1 scores, because both notebooks
+emit rows in one deterministic order of user and impression and align
+200,000-impression chunks by position, which also lets the BM25 adapter's
+one-entry cache score each user once rather than once per impression, at 4,356
+impressions per second against roughly 430 for Q2's non-contiguous sample.
 
-The two scales are 205.9\,M and 93.1\,M candidate rows. Rather than join the
-feature table to the Stage-1 scores, both notebooks produce their rows in one
-deterministic \code{(user\_id, impression\_id)} order and align 200{,}000-impression
-chunks by position, asserting per chunk that both sides list the same
-impressions and candidates. Producing that order is itself the optimization
-worth recording: a plain polars sort of the 13.5\,M-row EB-NeRD behaviors
-peaked at 10.1\,GB on this 15.7\,GB machine, so it is an external range sort
-(16 key-range buckets, row-group-batched reads, one writer per bucket) at a
-2.55\,GB peak, row-identical to the whole-file sort. The user-contiguous order
-is also what lets the BM25 adapter's one-entry cache score each user's
-corpus once rather than per impression: Stage-1 plus re-ranking ran at
-4{,}356 impressions/s on EB-NeRD (51.8\,min for 13{,}536{,}710 impressions)
-against the ${\sim}430$/s of the non-contiguous evaluation sample in Q2.
-Feature building took 230\,min (980/s) and 15\,min (2{,}664/s); the EB-NeRD
-build held 10.4--12.8\,GB resident, the same envelope as the
-\code{ebnerd\_large} build in Q1.
+\begin{center}
+\includegraphics[width=0.8\textwidth]{ebnerd_results_reranker.png}\\[3pt]
+\includegraphics[width=0.8\textwidth]{mind_results_reranker.png}
+\end{center}
 
-Each zip was checked line by line against \code{behaviors.parquet} (one line
-per row in file order, matching id and candidate count, a valid permutation)
-and, independently of the notebook, against A1's embedding-baseline file for
-the same population: the re-ranker picks the same top candidate as the
-embedding baseline for 43.6\% of MIND impressions and 24.2\% of EB-NeRD's,
-with 8.0\% and 0.5\% identical permutations --- a different ranking of the
-same candidate lists, in proportion to how much of each booster's gain the
-embedding score carries (12.5\% and 0.1\%).
+Both were scored. The RecSys 2024 Challenge returns AUC 0.6547 with MRR 0.428,
+nDCG@5 0.4802 and nDCG@10 0.5404, placing 8th of 269 entries, and MIND returns
+AUC 0.6223 with MRR 0.3016, nDCG@5 0.3234 and nDCG@10 0.3793. These corroborate
+the offline evaluation rather than restate it, being measured on weeks the
+pipeline never saw, with 0.6547 against the 0.6490 held-out AUC of
+Section~\ref{sec:results} and 0.6223 against 0.6099. The EB-NeRD entry is also
+directly comparable with A1's, which scored the same blind population at AUC
+0.5141 using BM25 retrieval, so the two-stage pipeline adds \textbf{+0.1406
+AUC} on the leaderboard itself. That is a before-and-after measured by the
+organisers rather than by this project's own harness, and it is consistent in
+direction with the $+0.0979$ held-out gain.
 
-\todo{Screenshots from both Codabench competitions, with the two-stage
-pipeline's score next to A1's BM25/embedding entries.}
+One operational note belongs here, since it cost more time than any modelling
+decision. Codabench dispatches jobs to a participant-run compute worker, and
+the current server encodes the submission secret in kombu 5.x's wrapper format
+while naming bundles per phase, so every published worker image disagrees with
+one or both conventions. This worker logged 26 failed status updates out of 26
+attempts across 14 jobs and three weeks, each failing before the submission
+file was downloaded. Three jobs did reach the running state, which is why the
+affected submissions sat as submitted rather than erroring outright. Since the
+queue is shared between participants, A1's one scored EB-NeRD entry was
+handled by another participant's worker. Three one-line compatibility shims
+produced the first successful run in this worker's history.
 
 \end{document}
